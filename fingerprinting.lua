@@ -2,23 +2,24 @@
 -- Module: AnimSim
 -- Similarity & dedup for CurveAnimation clips.
 
-export type CanonFrame = {
+
+--"run --run C:\\git\\roblox\\jrein\\anim-simularity\\fingerprinting.lua --fs.readwrite C:\\git\\roblox\\jrein\\anim-simularity\\ --load.asRobloxScript"
+
+export type AnimTransform = {
 	pos: Vector3,     -- local-space
 	rot: CFrame,      -- local-space orientation (we'll store quaternion)
-	scl: Vector3,     -- local-space scale if available (else Vector3.new(1,1,1))
 }
 
-export type TrackSeries = { CanonFrame }               -- [frame]
-export type ClipSeries = { [string]: TrackSeries }     -- boneName -> TrackSeries
+export type TrackFrames = { AnimTransform }          -- [transform]
+export type ClipData = { [string]: TrackFrames }     -- boneName -> TrackFrames
 
-export type CanonParams = {
+export type FingerprintParams = {
 	FPS: number?,                 -- default 60
 	DurationMode: "NormalizeTo1" | "Preserve", -- default "NormalizeTo1"
 	QuantPos: number?,            -- meters (default 1e-3)
 	QuantQuat: number?,           -- quaternion bin (default 1e-4)
-	IncludeScale: boolean?,       -- default false
 	--Mirror: boolean?,             -- produce mirrored variant (off by default)
-	TrackOrder: {string}?,        -- canonical track order; if nil, inferred sorted keys
+	TrackOrder: {string}?,        -- canonical track order; if nil R15
 	FramesOverride: number?,      -- optional fixed frame count after normalization
 }
 
@@ -94,6 +95,32 @@ local function getCurveValueAtTime(curve: Instance, time: number)
 	end
 end
 
+local function calculateCurveAnimLength(curveAnim: Instance): number
+
+	local tracks = getCurveTracks(curveAnim)
+
+	local maxTime = -1
+	local function getMaxTimeFromFloatCurveChildren(containerInput: Instance?)
+		if not containerInput then
+			return
+		end
+		local container = containerInput :: Instance
+		for _, floatCurve in container:GetChildren() do
+			if not floatCurve:IsA("FloatCurve") then
+				continue
+			end
+			for _, floatCurveKey in floatCurve:GetKeys() do
+				maxTime = math.max(maxTime, floatCurveKey.Time)
+			end
+		end
+	end
+
+	for _, t in tracks do
+		getMaxTimeFromFloatCurveChildren(t.pos)
+		getMaxTimeFromFloatCurveChildren(t.rot)
+	end
+	return maxTime
+end
 
 -- ==============================
 -- Small math helpers (quats etc)
@@ -256,7 +283,6 @@ local function quatToCFrame(x:number,y:number,z:number,w:number): CFrame
 	return CFrame.new(0,0,0, m00,m01,m02, m10,m11,m12, m20,m21,m22)
 end
 
--- Quaternion helpers 
 local function quatHemisphereAlign(ax,ay,az,aw, bx,by,bz,bw)
 	-- Flip b if dot(a,b) < 0 so logs average consistently
 	local dot = ax*bx + ay*by + az*bz + aw*bw
@@ -279,26 +305,19 @@ local function quatLog(x,y,z,w) -- maps unit quat -> R^3 (axis * angle)
 	return x*s, y*s, z*s
 end
 
-
--- ==============================
--- Adapter: sample CurveAnimation
--- ==============================
--- You must implement this for your CurveAnimation authoring setup.
 -- Given (curveAnim, boneName, tSeconds), return local-space transform for that bone at t:
-local function SampleTrackTransform(track: {}, t: number): CanonFrame
+local function SampleTrackTransform(track: {}, t: number): AnimTransform
 	
 	if not track then
 		return {
 			pos = Vector3.zero,
 			rot = CFrame.new(),
-			scl = Vector3.new(1,1,1),
 		}
 	end
 
 	return {
 		pos = getCurveValueAtTime(track.pos, t),
 		rot = getCurveValueAtTime(track.rot, t),
-		scl = Vector3.new(1,1,1),
 	}
 end
 
@@ -311,7 +330,7 @@ local function buildTrackList(curveAnim: Instance, explicitOrder:{string}?): {st
 		return table.clone(explicitOrder)
 	end
 
-	-- return a common humanoid subset:
+	-- return R15:
 	local R15BoneNames = {
 		"HumanoidRootPart","LowerTorso","UpperTorso","Head",
 		"LeftUpperArm","LeftLowerArm","LeftHand",
@@ -322,17 +341,16 @@ local function buildTrackList(curveAnim: Instance, explicitOrder:{string}?): {st
 	return R15BoneNames
 end
 
-local function canonicalize(curveAnim: Instance, duration:number, params: CanonParams?): (ClipSeries, number, {string})
+local function canonicalize(curveAnim: Instance, duration:number, params: FingerprintParams?): (ClipData, number, {string})
 	params = params or {}
 	local FPS = params.FPS or 60
 	local quantPos = params.QuantPos or 1e-3
 	local quantQuat = params.QuantQuat or 1e-4
 	local durationMode = params.DurationMode or "NormalizeTo1"
-	local includeScale = params.IncludeScale or false
 	local framesOverride = params.FramesOverride
 
 	local tracks = buildTrackList(curveAnim, params.TrackOrder)
-	local out: ClipSeries = {}
+	local out: ClipData = {}
 	
 	local tracksCurves = getCurveTracks(curveAnim)
 
@@ -342,7 +360,7 @@ local function canonicalize(curveAnim: Instance, duration:number, params: CanonP
 	local dt = normDuration / math.max(1, numFrames-1)
 
 	for _, bone in ipairs(tracks) do
-		local series: TrackSeries = table.create(numFrames)
+		local frames: TrackFrames = table.create(numFrames)
 		for i=0,numFrames-1 do
 			local t = i * dt
 			-- Map resampled time back to source duration if preserving:
@@ -361,26 +379,20 @@ local function canonicalize(curveAnim: Instance, duration:number, params: CanonP
 			local py = quantizeFloat(fr.pos.Y, quantPos)
 			local pz = quantizeFloat(fr.pos.Z, quantPos)
 			local sx,sy,sz = 1,1,1
-			if includeScale then
-				sx = quantizeFloat(fr.scl.X, 1e-3)
-				sy = quantizeFloat(fr.scl.Y, 1e-3)
-				sz = quantizeFloat(fr.scl.Z, 1e-3)
-			end
 
-			series[i+1] = {
+			frames[i+1] = {
 				pos = Vector3.new(px,py,pz),
 				rot = quatToCFrame(qx,qy,qz,qw), 
-				scl = Vector3.new(sx,sy,sz),
 			}
 		end
-		out[bone] = series
+		out[bone] = frames
 	end
 
 	return out, numFrames, tracks
 end
 
 -- Serialize canonical clip to bytes in stable order -------------
-local function serializeClip(cs: ClipSeries, tracks:{string}, includeScale:boolean): string
+local function serializeClip(cs: ClipData, tracks:{string}): string
 	local chunks = table.create(#tracks * 32)
 	for _,bone in ipairs(tracks) do
 		local series = cs[bone]
@@ -396,18 +408,13 @@ local function serializeClip(cs: ClipSeries, tracks:{string}, includeScale:boole
 			table.insert(chunks, writeUInt32LE(quantizeFloat(qy, 1e-4)))
 			table.insert(chunks, writeUInt32LE(quantizeFloat(qz, 1e-4)))
 			table.insert(chunks, writeUInt32LE(quantizeFloat(qw, 1e-4)))
-			if includeScale then
-				table.insert(chunks, writeUInt32LE(fr.scl.X))
-				table.insert(chunks, writeUInt32LE(fr.scl.Y))
-				table.insert(chunks, writeUInt32LE(fr.scl.Z))
-			end
 		end
 	end
 	return table.concat(chunks)
 end
 
 -- Per-track exact hash + SimHash over shingles ------------------
-local function perTrackHashes(cs: ClipSeries, tracks:{string})
+local function perTrackHashes(cs: ClipData, tracks:{string})
 	local exact: { [string]: number } = {}
 	local ph:    { [string]: number } = {}
 
@@ -445,7 +452,7 @@ local function perTrackHashes(cs: ClipSeries, tracks:{string})
 end
 
 -- 128D embedding with pose + motion
-local function buildEmbedding(cs: ClipSeries, tracks:{string})
+local function buildEmbedding(cs: ClipData, tracks:{string})
 	-- Collect features in a deterministic bone order
 	local feat = {}
 
@@ -636,12 +643,72 @@ local function buildEmbedding(cs: ClipSeries, tracks:{string})
 	return feat
 end
 
+-- 128D embedding
+local function buildEmbedding2(cs: ClipData, tracks:{string})
+	local feat = {}
+
+	local function push(x:number) table.insert(feat, x) end
+	local function push3(x:number,y:number,z:number) push(x); push(y); push(z) end
+	
+	-- Pass 1: precompute quaternion arrays per bone
+	local quats: {[string]: {{x:number,y:number,z:number,w:number}}} = {}
+	for _,bone in ipairs(tracks) do
+		local s = cs[bone] or {}
+		local qarr = table.create(#s)
+		for i=1,#s do
+			local qx,qy,qz,qw = cframeToQuat(s[i].rot)
+			-- Align hemisphere over time against the first frame for stability
+			if i == 1 then
+				qarr[i] = {x=qx,y=qy,z=qz,w=qw}
+			else
+				local ax,ay,az,aw = qarr[1].x, qarr[1].y, qarr[1].z, qarr[1].w
+				local bx,by,bz,bw = quatHemisphereAlign(ax,ay,az,aw, qx,qy,qz,qw)
+				qarr[i] = {x=bx,y=by,z=bz,w=bw}
+			end
+		end
+		quats[bone] = qarr
+	end
+	
+	-- Pass 2: build features per bone
+	for _,bone in ipairs(tracks) do
+		local s = cs[bone] or {}
+		local n = #s
+
+		do
+			for i=1,n do
+				local q = quats[bone][i]
+				local lx,ly,lz = quatLog(q.x,q.y,q.z,q.w)
+				push3(lx,ly,lz)
+				local p = s[i].pos
+				push3(p.X, p.Y, p.Z)
+			end
+		end
+	end
+
+	-- ===== Post-process: size control to 128D and L2 normalize ====
+	-- If too few tracks/frames, we’ll have <128; pad with zeros.
+	while #feat < 128 do table.insert(feat, 0.0) end
+	if #feat > 128 then
+		for i=129,#feat do
+			local j = ((i-1) % 128) + 1
+			feat[j] += feat[i]
+		end
+		for i=#feat,129,-1 do table.remove(feat) end
+	end
+	
+	-- L2 normalize
+	local acc = 0.0
+	for _,x in ipairs(feat) do acc += x*x end
+	local inv = (acc>0) and (1.0/math.sqrt(acc)) or 1.0
+	for i=1,#feat do feat[i] *= inv end
+
+	return feat
+end
 
 -- Public: fingerprint a CurveAnimation --------------------------
-function AnimSim.Fingerprint(curveAnim: Instance, duration:number, params: CanonParams?): Fingerprint
-	local includeScale = (params and params.IncludeScale) or false
+function AnimSim.Fingerprint(curveAnim: Instance, duration:number, params: FingerprintParams?): Fingerprint
 	local cs, numFrames, tracks = canonicalize(curveAnim, duration, params)
-	local bytes = serializeClip(cs, tracks, includeScale)
+	local bytes = serializeClip(cs, tracks)
 	local clipHash = fnv1a32(bytes)
 	--local perExact, perPhash = perTrackHashes(cs, tracks)
 	local embed = buildEmbedding(cs, tracks)
@@ -673,7 +740,7 @@ local function cosine(a:{number}, b:{number})
 end
 
 -- Precise curve similarity --------------------------------------
-local function perTrackCurveSimilarity(sa:TrackSeries, sb:TrackSeries, allowPhase:boolean, maxPhase:number)
+local function perTrackCurveSimilarity(sa:TrackFrames, sb:TrackFrames, allowPhase:boolean, maxPhase:number)
 	-- We compute RMSE for position and quaternion angle, optionally over best phase shift.
 	local function scoreForPhase(phase:number)
 		local cnt = 0
@@ -723,13 +790,13 @@ function AnimSim.Score(curveA: Instance, durA:number, curveB: Instance, durB:num
 	local wPos = scoreParams.PositionWeight or 0.4
 	local effW = scoreParams.EndEffectorWeights or {}
 
-	local canonParams: CanonParams = {
+	local fingerprintParams: FingerprintParams = {
 		FPS = 60, DurationMode = "NormalizeTo1",
 		QuantPos = 1e-3, QuantQuat = 1e-4,
-		IncludeScale = false, TrackOrder = trackOrder,
+		TrackOrder = trackOrder,
 	}
-	local csA, _, tracks = canonicalize(curveA, durA, canonParams)
-	local csB, _, _ = canonicalize(curveB, durB, canonParams)
+	local csA, _, tracks = canonicalize(curveA, durA, fingerprintParams)
+	local csB, _, _ = canonicalize(curveB, durB, fingerprintParams)
 
 	local perTrack = {}
 	local bestPhaseGlobal = 0
@@ -781,42 +848,17 @@ function AnimSim.EmbeddingSimilarity(fpa: Fingerprint, fpb: Fingerprint): number
 	return cosine(fpa.embedding, fpb.embedding)
 end
 
+print("Running:")
 
-local function calculateCurveAnimLength(curveAnim: Instance): number
-
-	local tracks = getCurveTracks(curveAnim)
-
-	local maxTime = -1
-	local function getMaxTimeFromFloatCurveChildren(containerInput: Instance?)
-		if not containerInput then
-			return
-		end
-		local container = containerInput :: Instance
-		for _, floatCurve in container:GetChildren() do
-			if not floatCurve:IsA("FloatCurve") then
-				continue
-			end
-			for _, floatCurveKey in floatCurve:GetKeys() do
-				maxTime = math.max(maxTime, floatCurveKey.Time)
-			end
-		end
-	end
-
-	for _, t in tracks do
-		getMaxTimeFromFloatCurveChildren(t.pos)
-		getMaxTimeFromFloatCurveChildren(t.rot)
-	end
-	return maxTime
-end
-
-
-local csv = "animId,clipId,duration,hash,embedding1-128,\n"
+local csv = ""--"animId,clipId,duration,hash,embedding1-128,\n"
 
 local count = 0
 local FileSystemService = game:GetService("FileSystemService")
-for fileData in FileSystemService:Walk("C:\\git\\roblox\\anim-similarity\\out\\clips\\", Enum.FileSystemWalkMode.NonRecursive) do
+for fileData in FileSystemService:Walk("C:\\git\\roblox\\jrein\\anim-simularity\\out\\clips\\", Enum.FileSystemWalkMode.NonRecursive) do
 	--print(fileData.Path)
 	local clip = FileSystemService:LoadInstances(fileData.Path)[1]
+	
+	-- TODO: support KFS
 	if not clip or not clip:IsA("CurveAnimation") then
 		print("clip is not a curve animation", clip, clip.ClassName, fileData.Path)
 		continue
@@ -824,10 +866,11 @@ for fileData in FileSystemService:Walk("C:\\git\\roblox\\anim-similarity\\out\\c
 	
 	local animId, clipId = fileData.Path:match(".*/(%d+)%-(%d+)%.rbxm$")
 
+	local line = ""
 	local success, result = pcall(function()
 		local duration = calculateCurveAnimLength(clip)
 		local fingerprint = AnimSim.Fingerprint(clip, duration, { FPS = 120, DurationMode = "NormalizeTo1" })
-		local line = animId .. "," .. clipId .. "," .. duration .. "," .. fingerprint.clipHash .. ","
+		line = animId .. "," .. clipId .. "," .. duration .. "," .. fingerprint.clipHash .. ","
 		for i, n in fingerprint.embedding do
 			line = line .. n .. ","
 		end
@@ -841,9 +884,14 @@ for fileData in FileSystemService:Walk("C:\\git\\roblox\\anim-similarity\\out\\c
 	
 	if count % 100 == 0 then
 		print(count)
+		--print(line)
 	end
+	
+	--if count > 2000 then
+	--	break
+	--end
 	
 	clip:Destroy()
 end
 
-FileSystemService:WriteFile("C:\\git\\roblox\\anim-similarity\\fingerprints3.csv", csv, Enum.FileMode.Text)
+FileSystemService:WriteFile("C:\\git\\roblox\\jrein\\anim-simularity\\fingerprints4.csv", csv, Enum.FileMode.Text)

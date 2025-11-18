@@ -1,7 +1,8 @@
+-- NOTE: this requires the cli to run with your FStringAuthCookie or it cannot download the assets
+
 -- https://roblox.atlassian.net/wiki/spaces/HOW/pages/1556186296/Roblox+Command+Line+Tool+roblox-cli
--- C:\git\roblox\game-engine4\build\ninja\studio\vs2019\x64\noopt\_deps\windows-x86_64.robloxdev-cli-src\robloxdev-cli.exe
 -- Run this cmd:
--- C:\git\roblox\game-engine4\build\ninja\studio\vs2019\x64\noopt\_deps\windows-x86_64.robloxdev-cli-src\robloxdev-cli.exe run --run C:\git\roblox\anim-similarity\download_clips.lua --fs.readwrite C:\git\roblox\anim-similarity\ --load.asRobloxScript
+-- C:\PATH\robloxdev-cli.exe run --run C:\PATH\anim-similarity\download_clips.lua --fs.readwrite C:\PATH\anim-similarity\ --load.asRobloxScript
 
 -- Parse a CSV string into rows of fields ({{string}}).
 -- Handles quoted fields (which may span multiple lines) and "" escapes.
@@ -81,23 +82,6 @@ local function parseCSV(csvData: string, sep: string?, quote: string?): {{string
 	return rows
 end
 
--- OPTIONAL: convenience to map rows to objects using header row.
-local function parseCSVWithHeader(csvData: string, sep: string?, quote: string?): { [number]: {[string]: string} }
-	local rows = parseCSV(csvData, sep, quote)
-	if #rows == 0 then return {} end
-	local header = rows[1]
-	local out = {}
-	for r = 2, #rows do
-		local rec = {}
-		local row = rows[r]
-		for c = 1, #header do
-			rec[header[c]] = row[c] or ""
-		end
-		table.insert(out, rec)
-	end
-	return out
-end
-
 local function getAssetIdFromUrl(url: string): number?
 	-- Try patterns in order of likelihood
 	local patterns = {
@@ -169,12 +153,3 @@ for r, row in ipairs(rows) do
 	end
 	
 end
-
-
---local instances = FileSystemService:LoadInstances("c:\\temp\\cli-test\\animations.rbxm")
---
---for i, inst in instances do
---	local name = "c:\\temp\\cli-test\\out\\" .. inst.Name .. ".rbxm"
---	print( i .. ": writing " .. name)		
---	FileSystemService:WriteInstances(name, inst:GetChildren())
---end

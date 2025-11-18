@@ -2,13 +2,14 @@ import csv
 import numpy as np
 
 CSV_PATH = "fingerprints3.csv"
-THRESHOLD = 0.975
+THRESHOLD = 0.985
 
 # ---------------------------------------------------------
 # 1. Load AnimIds + Embeddings
 # ---------------------------------------------------------
 
 anim_ids = []
+durations = {}
 emb_list = []
 
 with open(CSV_PATH, newline='', encoding="utf-8") as f:
@@ -17,6 +18,7 @@ with open(CSV_PATH, newline='', encoding="utf-8") as f:
 
     for row in reader:
         anim_ids.append(row[0])  # AnimId
+        durations[row[0]] = float(row[2])# Duration
         
         emb = np.array([float(x) for x in row[4:4+128]], dtype=np.float32)
         emb_list.append(emb)
@@ -40,7 +42,7 @@ normed = embeddings / np.maximum(norms, 1e-8)
 # RESULTS[AnimId] = [(OtherAnimId, similarity), ...]
 RESULTS = {aid: [] for aid in anim_ids}
 
-BATCH = 1000
+BATCH = 30000
 
 for i in range(0, N, BATCH):
     end_i = min(i + BATCH, N)
@@ -74,16 +76,27 @@ for aid in RESULTS:
 # ---------------------------------------------------------
 # 5. Write results
 # ---------------------------------------------------------
-
+found = {}
 with open("similar_anim_ids3.txt", "w", encoding="utf-8") as out:
     for aid in anim_ids:
         sims = RESULTS[aid]
         if not sims:
             continue
 
-        out.write(f"https://www.roblox.com/catalog/{aid}:\n")
-        for other_id, sim in sims:
-            out.write(f"    https://www.roblox.com/catalog/{other_id} {sim:.6f}\n")
-        out.write("\n")
+        duration1 = durations[aid]
+        line = ""
+        for other_id, sim in sims:         
+            duration2 = durations[other_id]
+            pair = (other_id, aid)
+            if pair in found or abs(duration1 - duration2) > 0.5:
+                continue
+                
+            line = line + f"    https://www.roblox.com/catalog/{other_id} {sim:.6f} {duration2:.2f}\n"      
+            found[(aid, other_id)] = sim
+        
+        if len(line) > 0:          
+            out.write(f"https://www.roblox.com/catalog/{aid}: {duration1:.2f}\n")
+            out.write(line)
+            out.write("\n")
 
 print("Done: similar_anim_ids.txt generated")
