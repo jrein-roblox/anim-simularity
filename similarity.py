@@ -1,8 +1,8 @@
 import csv
 import numpy as np
 
-CSV_PATH = "fingerprints3.csv"
-THRESHOLD = 0.985
+CSV_PATH = "fingerprints4.csv"
+THRESHOLD = 0.98
 
 # ---------------------------------------------------------
 # 1. Load AnimIds + Embeddings
@@ -77,7 +77,7 @@ for aid in RESULTS:
 # 5. Write results
 # ---------------------------------------------------------
 found = {}
-with open("similar_anim_ids3.txt", "w", encoding="utf-8") as out:
+with open("similar_anim_ids4.txt", "w", encoding="utf-8") as out:
     for aid in anim_ids:
         sims = RESULTS[aid]
         if not sims:
@@ -88,7 +88,7 @@ with open("similar_anim_ids3.txt", "w", encoding="utf-8") as out:
         for other_id, sim in sims:         
             duration2 = durations[other_id]
             pair = (other_id, aid)
-            if pair in found or abs(duration1 - duration2) > 0.5:
+            if pair in found or abs(duration1 - duration2) > 2.5:
                 continue
                 
             line = line + f"    https://www.roblox.com/catalog/{other_id} {sim:.6f} {duration2:.2f}\n"      
