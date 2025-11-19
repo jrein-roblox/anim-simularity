@@ -321,7 +321,7 @@ local function canonicalize(duration:number, params: FingerprintParams?): (ClipD
 	local numFrames = framesOverride or math.max(1, math.floor(normDuration * FPS + 0.5))
 	local dt = normDuration / math.max(1, numFrames-1)
 	
-	-- setup out data
+	-- setup our data
 	for _, bone in ipairs(tracks) do
 		local frames: TrackFrames = table.create(numFrames)
 		out[bone] = frames
