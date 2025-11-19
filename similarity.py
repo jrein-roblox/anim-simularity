@@ -2,8 +2,7 @@ import csv
 import numpy as np
 
 CSV_PATH = "fingerprints4.csv"
-THRESHOLD = 0.98
-
+THRESHOLD = 0.99
 # ---------------------------------------------------------
 # 1. Load AnimIds + Embeddings
 # ---------------------------------------------------------
