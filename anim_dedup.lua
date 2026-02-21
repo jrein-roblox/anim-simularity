@@ -1,3 +1,12 @@
+-- NOTE: this requires the cli to run with your FStringAuthCookie or it cannot download the assets. You need to build RCC with FStringAuthCookie set in local flags.
+
+-- https://roblox.atlassian.net/wiki/spaces/HOW/pages/1556186296/Roblox+Command+Line+Tool+roblox-cli
+-- Run this cmd:
+-- C:\PATH\robloxdev-cli.exe run --run C:\PATH\anim-similarity\anim_dedup.lua --fs.readwrite C:\PATH\anim-similarity\ --load.asRobloxScript
+
+--C:\git\roblox\game-engine2\build\ninja\studio\vs2019\x64\optimized\Client\CLI\app\roblox-cli.exe run --run C:\git\roblox\jrein\anim-simularity\anim_dedup.lua --fs.readwrite C:\git\roblox\jrein\anim-simularity\ --load.asRobloxScript 
+
+
 -- Parse a CSV string into rows of fields ({{string}}).
 -- Handles quoted fields (which may span multiple lines) and "" escapes.
 local function parseCSV(csvData: string, sep: string?, quote: string?): {{string}}
@@ -234,24 +243,87 @@ local function u32(n:number): number
 	return n % U32
 end
 
+-- Safely multiplies two 32-bit integers without exceeding Luau's 53-bit float limit
+local function mul32(a: number, b: number): number
+	local a_lo = bit32.band(a, 0xFFFF)
+	local a_hi = bit32.rshift(a, 16)
+	local b_lo = bit32.band(b, 0xFFFF)
+	local b_hi = bit32.rshift(b, 16)
+	
+	-- We ignore a_hi * b_hi because it gets shifted completely out of the 32-bit space
+	local mid = (a_hi * b_lo + a_lo * b_hi) % 65536
+	local result = (a_lo * b_lo) + (mid * 65536)
+	
+	return result % U32
+end
+
 -- Little-endian 32-bit writer
-local function writeUInt32LE(n:number): string
-	n = u32(n)
-	local b0 = n % 256
-	local b1 = math.floor(n / 256) % 256
-	local b2 = math.floor(n / 65536) % 256
-	local b3 = math.floor(n / 16777216) % 256
-	return string.char(b0, b1, b2, b3)
+--local function writeUInt32LE(n:number): string
+--	n = u32(n)
+--	local b0 = n % 256
+--	local b1 = math.floor(n / 256) % 256
+--	local b2 = math.floor(n / 65536) % 256
+--	local b3 = math.floor(n / 16777216) % 256
+--	return string.char(b0, b1, b2, b3)
+--end
+
+local function writeUInt32LE(n: number): string
+	local b = buffer.create(4)
+	buffer.writeu32(b, 0, n)
+	return buffer.tostring(b)
 end
 
 -- FNV-1a 32 using bxor + mul with wrap
-local function fnv1a32(bytes:string): number
+local function fnv1a32(str: string): number
 	local hash = 0x811C9DC5
-	for i = 1, #bytes do
-		hash = bit32.bxor(hash, string.byte(bytes, i))
-		hash = u32(hash * 16777619)
+	local FNV_PRIME = 16777619
+	
+	for i = 1, #str do
+		hash = bit32.bxor(hash, string.byte(str, i))
+		hash = mul32(hash, FNV_PRIME)
 	end
+	
 	return hash
+end
+
+local function murmur3_32(str: string, seed: number?): number
+	local c1 = 0xcc9e2d51
+	local c2 = 0x1b873593
+	local h1 = seed or 0
+	local len = #str
+	
+	for i = 1, bit32.band(len, 0xfffffffc), 4 do
+		local k1 = string.unpack("<I4", str, i)
+		
+		k1 = mul32(k1, c1)
+		k1 = bit32.lrotate(k1, 15)
+		k1 = mul32(k1, c2)
+		
+		h1 = bit32.bxor(h1, k1)
+		h1 = bit32.lrotate(h1, 13)
+		h1 = (mul32(h1, 5) + 0xe6546b64) % U32
+	end
+	
+	local tail_len = bit32.band(len, 3)
+	local k1 = 0
+	if tail_len >= 3 then k1 = bit32.bxor(k1, bit32.lshift(string.byte(str, len - 2), 16)) end
+	if tail_len >= 2 then k1 = bit32.bxor(k1, bit32.lshift(string.byte(str, len - 1), 8)) end
+	if tail_len >= 1 then 
+		k1 = bit32.bxor(k1, string.byte(str, len))
+		k1 = mul32(k1, c1)
+		k1 = bit32.lrotate(k1, 15)
+		k1 = mul32(k1, c2)
+		h1 = bit32.bxor(h1, k1)
+	end
+	
+	h1 = bit32.bxor(h1, len)
+	h1 = bit32.bxor(h1, bit32.rshift(h1, 16))
+	h1 = mul32(h1, 0x85ebca6b)
+	h1 = bit32.bxor(h1, bit32.rshift(h1, 13))
+	h1 = mul32(h1, 0xc2b2ae35)
+	h1 = bit32.bxor(h1, bit32.rshift(h1, 16))
+	
+	return h1
 end
 
 local function quatToCFrame(x:number,y:number,z:number,w:number): CFrame
@@ -391,8 +463,9 @@ end
 local function hashAnimation(curveAnim: Instance, duration:number, params: FingerprintParams?): number
 	local cs, numFrames, tracks = canonicalize(curveAnim, duration, params)
 	local bytes = serializeClip(cs, tracks)
-	local clipHash = fnv1a32(bytes)	
-	return clipHash
+	local clipHash = fnv1a32(bytes)
+	local clipHash2 = murmur3_32(bytes)
+	return clipHash, clipHash2
 end
 
 
@@ -402,16 +475,16 @@ local InsertService = game:GetService("InsertService")
 -- First download all the animations
 local download = false
 if download then
-	local csvData = FileSystemService:ReadFile("C:\\git\\roblox\\jrein\\anim-simularity\\animations.csv", Enum.FileMode.Text)
+	local csvData = FileSystemService:ReadFile("C:\\git\\roblox\\jrein\\anim-simularity\\animations_02-05-26.csv", Enum.FileMode.Text)
 	local rows = parseCSV(csvData)
 	print("Anim count:", #rows)
 	for r, row in ipairs(rows) do
-		print(("Row %d: (%d fields)"):format(r, #row))
-		print("  id:", row[1], "name:", row[4])
-
-		
+		--print(("Row %d: (%d fields)"):format(r, #row))
+		--print("  id:", row[1], "name:", row[4])		
 		local id = tonumber(row[1])
-		local fileName = "C:\\git\\roblox\\jrein\\anim-simularity\\out\\" .. id .. ".rbxm"		
+		
+		local fileName = "C:\\git\\roblox\\jrein\\anim-simularity\\out\\" .. id .. ".rbxm"
+		print(fileName)
 		if FileSystemService:IsRegularFile(fileName) then
 			--print("Already exists!")
 			continue
@@ -452,6 +525,8 @@ end
 
 -- next build hashes
 local hashmap = {}
+local hashmap2 = {}
+local hashmap3 = {}
 local csv = ""--"animId,clipId,duration,hash\n"
 local count = 0
 for fileData in FileSystemService:Walk("C:\\git\\roblox\\jrein\\anim-simularity\\out\\clips\\", Enum.FileSystemWalkMode.NonRecursive) do
@@ -460,7 +535,7 @@ for fileData in FileSystemService:Walk("C:\\git\\roblox\\jrein\\anim-simularity\
 	
 	-- TODO: support KFS
 	if not clip or not clip:IsA("CurveAnimation") then
-		print("clip is not a curve animation", clip, clip.ClassName, fileData.Path)
+		--print("clip is not a curve animation", clip, clip.ClassName, fileData.Path)
 		continue
 	end
 	
@@ -469,15 +544,28 @@ for fileData in FileSystemService:Walk("C:\\git\\roblox\\jrein\\anim-simularity\
 	local line = ""
 	local success, result = pcall(function()
 		local duration = calculateCurveAnimLength(clip)
-		local clipHash = hashAnimation(clip, duration, { FPS = 120, DurationMode = "NormalizeTo1" })
+		local clipHash, clipHash2 = hashAnimation(clip, duration, { FPS = 120, DurationMode = "NormalizeTo1" })
 		
-		if hashmap[clipHash] == nil then
-			hashmap[clipHash] = {animId}
+		--if hashmap[clipHash] == nil then
+		--	hashmap[clipHash] = {animId}
+		--else
+		--	table.insert(hashmap[clipHash], animId)
+		--end
+		--
+		--if hashmap2[clipHash2] == nil then
+		--	hashmap2[clipHash2] = {animId}
+		--else
+		--	table.insert(hashmap2[clipHash2], animId)
+		--end
+		
+		local clipHash3 = string.format("%08X%08X", clipHash, clipHash2)
+		if hashmap3[clipHash3] == nil then
+			hashmap3[clipHash3] = {animId}
 		else
-			table.concat(hashmap[clipHash], animId)
+			table.insert(hashmap3[clipHash3], animId)
 		end
 		
-		line = animId .. "," .. clipId .. "," .. duration .. "," .. clipHash .. ",\n"
+		line = animId .. "," .. clipId .. "," .. duration .. "," .. clipHash .. "," .. clipHash2 ",\n"
 		csv = csv .. line
 	end)
 	
@@ -497,10 +585,74 @@ end
 
 FileSystemService:WriteFile("C:\\git\\roblox\\jrein\\anim-simularity\\hashes.csv", csv, Enum.FileMode.Text)
 
-for key, value in pairs(hashmap) do
+function compare_numbers(a, b)
+    return tonumber(a) < tonumber(b)
+end
+
+function compare_tables(a, b)
+    return tonumber(a[1]) < tonumber(b[1])
+end
+
+--local sortedTable = {}
+--for key, value in pairs(hashmap) do
+--	table.sort(value, compare_numbers)
+--	table.insert(sortedTable, value)
+--end
+--table.sort(sortedTable, compare_tables)
+--
+--local sortedTable2 = {}
+--for key, value in pairs(hashmap2) do
+--	table.sort(value, compare_numbers)
+--	table.insert(sortedTable2, value)
+--end
+--table.sort(sortedTable2, compare_tables)
+
+local sortedTable3 = {}
+for key, value in pairs(hashmap3) do
+	table.sort(value, compare_numbers)
+	table.insert(sortedTable3, value)
+end
+table.sort(sortedTable3, compare_tables)
+
+--local out = ""
+--for i, value in ipairs(sortedTable) do
+--	if #value > 1 then
+--		local line = ""
+--		for i, v in ipairs(value) do
+--			line = line .. v .. ","
+--		end
+--		out = out .. line .. "\n"
+--	end
+--end
+--
+----print(out)
+--FileSystemService:WriteFile("C:\\git\\roblox\\jrein\\anim-simularity\\dupes.csv", out, Enum.FileMode.Text)
+--
+--
+--out = ""
+--for i, value in ipairs(sortedTable2) do
+--	if #value > 1 then
+--		local line = ""
+--		for i, v in ipairs(value) do
+--			line = line .. v .. ","
+--		end
+--		out = out .. line .. "\n"
+--	end
+--end
+--
+----print(out)
+--FileSystemService:WriteFile("C:\\git\\roblox\\jrein\\anim-simularity\\dupes2.csv", out, Enum.FileMode.Text)
+
+out = ""
+for i, value in ipairs(sortedTable3) do
 	if #value > 1 then
+		local line = ""
 		for i, v in ipairs(value) do
-			print(hash, v, i)
+			line = line .. v .. ","
 		end
+		out = out .. line .. "\n"
 	end
 end
+
+--print(out)
+FileSystemService:WriteFile("C:\\git\\roblox\\jrein\\anim-simularity\\dupes3.csv", out, Enum.FileMode.Text)
