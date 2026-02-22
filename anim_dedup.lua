@@ -4,6 +4,7 @@
 -- Run this cmd:
 -- C:\PATH\robloxdev-cli.exe run --run C:\PATH\anim-similarity\anim_dedup.lua --fs.readwrite C:\PATH\anim-similarity\ --load.asRobloxScript
 
+-- This is the actual commandline used currently
 --C:\git\roblox\game-engine2\build\ninja\studio\vs2019\x64\optimized\Client\CLI\app\roblox-cli.exe run --run C:\git\roblox\jrein\anim-simularity\anim_dedup.lua --fs.readwrite C:\git\roblox\jrein\anim-simularity\ --load.asRobloxScript 
 
 
@@ -230,7 +231,6 @@ local function cframeToQuat(cf: CFrame)
 	return x/len, y/len, z/len, w/len
 end
 
-
 -- Pack quantized frame into bytes (stable) -----------------
 local function quantizeFloat(x:number, q:number)
 	return math.floor(x / q + 0.5)
@@ -257,32 +257,32 @@ local function mul32(a: number, b: number): number
 	return result % U32
 end
 
--- Little-endian 32-bit writer
---local function writeUInt32LE(n:number): string
---	n = u32(n)
---	local b0 = n % 256
---	local b1 = math.floor(n / 256) % 256
---	local b2 = math.floor(n / 65536) % 256
---	local b3 = math.floor(n / 16777216) % 256
---	return string.char(b0, b1, b2, b3)
---end
-
 local function writeUInt32LE(n: number): string
 	local b = buffer.create(4)
 	buffer.writeu32(b, 0, n)
 	return buffer.tostring(b)
 end
 
+-- This original implementation is faulty due to the 53bit rounding errors generated when using
+-- lua's floating point math. Keeping for comparison to corrected version.
+local function fnv1a32_broken(bytes:string): number
+	local hash = 0x811C9DC5
+	for i = 1, #bytes do
+		hash = bit32.bxor(hash, string.byte(bytes, i))
+		hash = u32(hash * 16777619)
+	end
+	return hash
+
+end
+
 -- FNV-1a 32 using bxor + mul with wrap
 local function fnv1a32(str: string): number
 	local hash = 0x811C9DC5
 	local FNV_PRIME = 16777619
-	
 	for i = 1, #str do
 		hash = bit32.bxor(hash, string.byte(str, i))
 		hash = mul32(hash, FNV_PRIME)
 	end
-	
 	return hash
 end
 
@@ -473,7 +473,7 @@ local FileSystemService = game:GetService("FileSystemService")
 local InsertService = game:GetService("InsertService")
 
 -- First download all the animations
-local download = false
+local download = false -- enable to download missing assets
 if download then
 	local csvData = FileSystemService:ReadFile("C:\\git\\roblox\\jrein\\anim-simularity\\animations_02-05-26.csv", Enum.FileMode.Text)
 	local rows = parseCSV(csvData)
@@ -490,6 +490,7 @@ if download then
 			continue
 		end
 		
+		-- first get the marketplace asset which points to an animation asset
 		local clipId
 		local success, result = pcall(function()
 			local model = InsertService:LoadAsset(id)
@@ -506,8 +507,8 @@ if download then
 			continue
 		end
 		
-		local clipFileName = "C:\\git\\roblox\\jrein\\anim-simularity\\out\\clips\\" .. id .. "-" .. clipId .. ".rbxm"	
-		
+		-- now get the actual animation clip data
+		local clipFileName = "C:\\git\\roblox\\jrein\\anim-simularity\\out\\clips\\" .. id .. "-" .. clipId .. ".rbxm"		
 		local success, result = pcall(function()
 			local clip = InsertService:LoadAsset(clipId)
 			print(clip)
@@ -527,6 +528,8 @@ end
 local hashmap = {}
 local hashmap2 = {}
 local hashmap3 = {}
+local set1 = {}
+local set2 = {}
 local csv = ""--"animId,clipId,duration,hash\n"
 local count = 0
 for fileData in FileSystemService:Walk("C:\\git\\roblox\\jrein\\anim-simularity\\out\\clips\\", Enum.FileSystemWalkMode.NonRecursive) do
@@ -541,23 +544,30 @@ for fileData in FileSystemService:Walk("C:\\git\\roblox\\jrein\\anim-simularity\
 	
 	local animId, clipId = fileData.Path:match(".*/(%d+)%-(%d+)%.rbxm$")
 
-	local line = ""
+	--local line = ""
 	local success, result = pcall(function()
 		local duration = calculateCurveAnimLength(clip)
 		local clipHash, clipHash2 = hashAnimation(clip, duration, { FPS = 120, DurationMode = "NormalizeTo1" })
 		
-		--if hashmap[clipHash] == nil then
-		--	hashmap[clipHash] = {animId}
-		--else
-		--	table.insert(hashmap[clipHash], animId)
-		--end
-		--
-		--if hashmap2[clipHash2] == nil then
-		--	hashmap2[clipHash2] = {animId}
-		--else
-		--	table.insert(hashmap2[clipHash2], animId)
-		--end
+		if hashmap[clipHash] == nil then
+			hashmap[clipHash] = {animId}
+		else
+			table.insert(hashmap[clipHash], animId)
+			for i, value in ipairs(hashmap[clipHash]) do
+				set1[value] = true
+			end
+		end
 		
+		if hashmap2[clipHash2] == nil then
+			hashmap2[clipHash2] = {animId}
+		else
+			table.insert(hashmap2[clipHash2], animId)
+			for i, value in ipairs(hashmap2[clipHash2]) do
+				set2[value] = true
+			end
+		end
+		
+		-- combine the two 32bit hashes for a super strong 64bit that basically makes collisions impossible
 		local clipHash3 = string.format("%08X%08X", clipHash, clipHash2)
 		if hashmap3[clipHash3] == nil then
 			hashmap3[clipHash3] = {animId}
@@ -576,7 +586,7 @@ for fileData in FileSystemService:Walk("C:\\git\\roblox\\jrein\\anim-simularity\
 		--print(line)
 	end
 	
-	--if count > 2000 then
+	--if count > 1000 then
 	--	break
 	--end
 	
@@ -585,27 +595,45 @@ end
 
 FileSystemService:WriteFile("C:\\git\\roblox\\jrein\\anim-simularity\\hashes.csv", csv, Enum.FileMode.Text)
 
+-- Test code to detect collisions between the two hashes for debugging.
+function set_difference(set_a, set_b)
+    local difference_set = {}
+    for element, present in pairs(set_a) do
+        -- Check if the element from set_a is NOT in set_b
+        if set_b[element] == nil then
+            difference_set[element] = true
+        end
+    end
+    return difference_set
+end
+
+local difference = set_difference(set1, set2)
+for key, value in pairs(difference) do
+	print(key, "missing from sets")
+end
+print("-------------------------------------")
+
 function compare_numbers(a, b)
     return tonumber(a) < tonumber(b)
 end
 
 function compare_tables(a, b)
-    return tonumber(a[1]) < tonumber(b[1])
+    return a[1] < b[1]
 end
 
---local sortedTable = {}
---for key, value in pairs(hashmap) do
---	table.sort(value, compare_numbers)
---	table.insert(sortedTable, value)
---end
---table.sort(sortedTable, compare_tables)
---
---local sortedTable2 = {}
---for key, value in pairs(hashmap2) do
---	table.sort(value, compare_numbers)
---	table.insert(sortedTable2, value)
---end
---table.sort(sortedTable2, compare_tables)
+local sortedTable = {}
+for key, value in pairs(hashmap) do
+	table.sort(value, compare_numbers)
+	table.insert(sortedTable, value)
+end
+table.sort(sortedTable, compare_tables)
+
+local sortedTable2 = {}
+for key, value in pairs(hashmap2) do
+	table.sort(value, compare_numbers)
+	table.insert(sortedTable2, value)
+end
+table.sort(sortedTable2, compare_tables)
 
 local sortedTable3 = {}
 for key, value in pairs(hashmap3) do
@@ -614,35 +642,37 @@ for key, value in pairs(hashmap3) do
 end
 table.sort(sortedTable3, compare_tables)
 
---local out = ""
---for i, value in ipairs(sortedTable) do
---	if #value > 1 then
---		local line = ""
---		for i, v in ipairs(value) do
---			line = line .. v .. ","
---		end
---		out = out .. line .. "\n"
---	end
---end
---
-----print(out)
---FileSystemService:WriteFile("C:\\git\\roblox\\jrein\\anim-simularity\\dupes.csv", out, Enum.FileMode.Text)
---
---
---out = ""
---for i, value in ipairs(sortedTable2) do
---	if #value > 1 then
---		local line = ""
---		for i, v in ipairs(value) do
---			line = line .. v .. ","
---		end
---		out = out .. line .. "\n"
---	end
---end
---
-----print(out)
---FileSystemService:WriteFile("C:\\git\\roblox\\jrein\\anim-simularity\\dupes2.csv", out, Enum.FileMode.Text)
+local count = 0
+local out = ""
+for i, value in ipairs(sortedTable) do
+	if #value > 1 then
+		local line = ""
+		for i, v in ipairs(value) do
+			line = line .. v .. ","
+		end
+		out = out .. line .. "\n"
+		count = count + 1
+	end
+end
+print("hash_fnv1", count)
+FileSystemService:WriteFile("C:\\git\\roblox\\jrein\\anim-simularity\\dupes.csv", out, Enum.FileMode.Text)
 
+count = 0
+out = ""
+for i, value in ipairs(sortedTable2) do
+	if #value > 1 then
+		local line = ""
+		for i, v in ipairs(value) do
+			line = line .. v .. ","
+		end
+		out = out .. line .. "\n"
+		count = count + 1
+	end
+end
+print("hash_murmur", count)
+FileSystemService:WriteFile("C:\\git\\roblox\\jrein\\anim-simularity\\dupes2.csv", out, Enum.FileMode.Text)
+
+count = 0
 out = ""
 for i, value in ipairs(sortedTable3) do
 	if #value > 1 then
@@ -651,8 +681,8 @@ for i, value in ipairs(sortedTable3) do
 			line = line .. v .. ","
 		end
 		out = out .. line .. "\n"
+		count = count + 1
 	end
 end
-
---print(out)
+print("hash_combined", count)
 FileSystemService:WriteFile("C:\\git\\roblox\\jrein\\anim-simularity\\dupes3.csv", out, Enum.FileMode.Text)
