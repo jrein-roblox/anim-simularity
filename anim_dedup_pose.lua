@@ -1,193 +1,86 @@
 --!strict
 --[[
-  anim_dedup.lua — Exact duplicate detection for Roblox CurveAnimation clips
+  anim_dedup_pose.lua — Exact duplicate detection using Animator/AnimationTrack (pose-based)
 
-  Walks a folder of saved clip files (out/clips/*.rbxm), hashes each CurveAnimation
-  by canonicalizing pose data (normalized duration, fixed FPS, quantized pos/rot),
-  then groups clips that share the same hash and writes duplicate lists to CSV.
+  Same outputs as anim_dedup.lua, but poses a character by playing each clip via
+  Animator:LoadAnimation, stepping TimePosition and StepAnimations, then sampling
+  root-space bone transforms. Works with any clip type the engine can play
+  (e.g. KeyframeSequence and any type accepted by the registration API), not only
+  CurveAnimation.
 
-  Outputs:
-    hashes.csv   — animId, clipId, duration, hashFnv1a, hashMurmur (one row per clip)
-    dupes.csv    — groups of anim IDs that share the same FNV-1a hash (exact duplicates)
-    dupes2.csv   — same but for Murmur3 hash
-    dupes3.csv   — same but for combined 64-bit hash (fewest false collisions)
+  Walks out/clips/*.rbxm, registers each clip, plays it on an R15 character,
+  samples poses at normalized times, hashes the canonical pose stream, and writes:
+    hashes.csv   — animId, clipId, duration, hashFnv1a, hashMurmur
+    dupes.csv    — groups of anim IDs (same FNV-1a hash)
+    dupes2.csv   — groups (Murmur3 hash)
+    dupes3.csv   — groups (combined 64-bit hash)
 
   Requirements:
-    - Roblox CLI (roblox-cli) with --fs.readwrite so the script can read/write files.
-    - Clip files already on disk: out/clips/<animId>-<clipId>.rbxm (CurveAnimation only).
-    - To download clips first, use download_assets.lua with a CSV of catalog IDs.
+    - Roblox CLI with --fs.readwrite. Clip files in out/clips/<animId>-<clipId>.rbxm.
+    - Use download_assets.lua to download clips from a CSV first.
 
   Run:
-    roblox-cli run --run <path>/anim_dedup.lua --fs.readwrite <path> --load.asRobloxScript
-
-  Example:
-    roblox-cli run --run C:/repo/anim-simularity/anim_dedup.lua --fs.readwrite C:/repo/anim-simularity --load.asRobloxScript
+    roblox-cli run --run <path>/anim_dedup_pose.lua --fs.readwrite <path> --load.asRobloxScript
 ]]
 
 local FileSystemService = game:GetService("FileSystemService")
-local InsertService = game:GetService("InsertService")
+local KeyframeSequenceProvider = game:GetService("KeyframeSequenceProvider")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+RunService:Pause()
 
 -- =============================================================================
--- CONFIG — set paths and options here
+-- CONFIG
 -- =============================================================================
 local BASE_PATH = "C:\\git\\roblox\\jrein\\anim-simularity"
 local CLIPS_DIR = BASE_PATH .. "\\out\\clips"
-local HASHES_CSV = BASE_PATH .. "\\hashes.csv"
-local DUPES_FNV = BASE_PATH .. "\\dupes.csv"
-local DUPES_MURMUR = BASE_PATH .. "\\dupes2.csv"
-local DUPES_COMBINED = BASE_PATH .. "\\dupes3.csv"
+local HASHES_CSV = BASE_PATH .. "\\hashes_pose.csv"
+local DUPES_FNV = BASE_PATH .. "\\dupes_pose.csv"
+local DUPES_MURMUR = BASE_PATH .. "\\dupes_pose2.csv"
+local DUPES_COMBINED = BASE_PATH .. "\\dupes_pose3.csv"
 
-local FPS = 120
-local DURATION_MODE = "NormalizeTo1"
+local FPS = 30
+local NORMALIZE_DURATION = 1.0
 local LOG_EVERY = 100
 
 -- =============================================================================
--- CSV parsing
+-- R15 character and animator
 -- =============================================================================
-local function parseCSV(csvData: string, sep: string?, quote: string?): { { string } }
-	sep = sep or ","
-	quote = quote or '"'
-	csvData = csvData:gsub("\r\n", "\n"):gsub("\r", "\n")
-	local rows = {}
-	local row = {}
-	local fieldBuf = {}
-	local n = #csvData
-	local i = 1
-	local inQuotes = false
-
-	local function pushField()
-		table.insert(row, table.concat(fieldBuf))
-		table.clear(fieldBuf)
+local function spawnR15(cframe: CFrame): Model
+	local desc = Instance.new("HumanoidDescription")
+	local character = Players:CreateHumanoidModelFromDescription(desc, Enum.HumanoidRigType.R15)
+	character.Name = "AnimDedupPoseR15"
+	character.Parent = workspace
+	if character.PrimaryPart then
+		character:SetPrimaryPartCFrame(cframe)
+	else
+		local hrp = character:FindFirstChild("HumanoidRootPart")
+		if hrp then (hrp :: BasePart).CFrame = cframe end
 	end
-	local function pushRow()
-		pushField()
-		table.insert(rows, row)
-		row = {}
-	end
-
-	while i <= n do
-		local c = string.sub(csvData, i, i)
-		if inQuotes then
-			if c == quote then
-				local nxt = string.sub(csvData, i + 1, i + 1)
-				if nxt == quote then
-					table.insert(fieldBuf, quote)
-					i += 2
-				else
-					inQuotes = false
-					i += 1
-				end
-			else
-				table.insert(fieldBuf, c)
-				i += 1
-			end
-		else
-			if c == quote then
-				inQuotes = true
-				i += 1
-			elseif c == sep then
-				pushField()
-				i += 1
-			elseif c == "\n" then
-				pushRow()
-				i += 1
-			else
-				table.insert(fieldBuf, c)
-				i += 1
-			end
-		end
-	end
-	if inQuotes then inQuotes = false end
-	if #fieldBuf > 0 or #row > 0 then pushRow() end
-	return rows
+	return character
 end
 
-local function getAssetIdFromUrl(url: string): number?
-	local patterns = {
-		"[%?&]id=(%d+)",
-		"/(%d+)$",
-		"/id/(%d+)",
-		"=(%d+)$",
-	}
-	for _, pattern in ipairs(patterns) do
-		local id = string.match(url, pattern)
-		if id then return tonumber(id) end
-	end
-	return nil
-end
+local character = spawnR15(CFrame.new(0, 0, 0))
+local humanoid = character.Humanoid
+local animator = humanoid.Animator
+local hrp = character:FindFirstChild("HumanoidRootPart") :: BasePart
+
+-- R15 bones (no HumanoidRootPart; root-space pose, no root motion)
+local R15_BONES = {
+	"LowerTorso", "UpperTorso", "Head",
+	"LeftUpperArm", "LeftLowerArm", "LeftHand",
+	"RightUpperArm", "RightLowerArm", "RightHand",
+	"LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
+	"RightUpperLeg", "RightLowerLeg", "RightFoot",
+}
 
 -- =============================================================================
 -- Types
 -- =============================================================================
-export type AnimTransform = { pos: Vector3, rot: CFrame }
-export type TrackFrames = { AnimTransform }
-export type ClipData = { [string]: TrackFrames }
-export type FingerprintParams = {
-	FPS: number?,
-	DurationMode: "NormalizeTo1" | "Preserve"?,
-	QuantPos: number?,
-	QuantQuat: number?,
-	TrackOrder: { string }?,
-}
-
--- =============================================================================
--- CurveAnimation: read tracks and sample at time
--- =============================================================================
-local function getCurveTracks(curve: CurveAnimation): { [string]: { pos: Instance, rot: Instance } }
-	local tracks = {}
-	for _, des in ipairs(curve:GetDescendants()) do
-		if des:IsA("Folder") and des:FindFirstChild("Position") and des:FindFirstChild("Rotation") then
-			tracks[des.Name] = {
-				pos = des:FindFirstChild("Position") :: Instance,
-				rot = des:FindFirstChild("Rotation") :: Instance,
-			}
-		end
-	end
-	return tracks
-end
-
-local function getCurveValueAtTime(curve: Instance, time: number): any
-	if curve:IsA("FloatCurve") then
-		return curve:GetValueAtTime(time)
-	elseif curve:IsA("Vector3Curve") then
-		local v = curve:GetValueAtTime(time)
-		return Vector3.new(v[1], v[2], v[3])
-	elseif curve:IsA("EulerRotationCurve") then
-		return curve:GetRotationAtTime(time)
-	elseif curve:IsA("RotationCurve") then
-		return curve:GetValueAtTime(time)
-	elseif curve:IsA("MarkerCurve") then
-		local markers = curve:GetMarkers()
-		for i = #markers, 1, -1 do
-			if markers[i].Time <= time then
-				return markers[i].Value
-			end
-		end
-		return nil
-	else
-		warn("Unrecognized curve type:", curve.ClassName)
-		return nil
-	end
-end
-
-local function calculateCurveAnimLength(curveAnim: Instance): number
-	local tracks = getCurveTracks(curveAnim :: CurveAnimation)
-	local maxTime = -1
-	local function scanFloatKeys(container: Instance?)
-		if not container then return end
-		for _, child in container:GetChildren() do
-			if not child:IsA("FloatCurve") then continue end
-			for _, key in child:GetKeys() do
-				maxTime = math.max(maxTime, key.Time)
-			end
-		end
-	end
-	for _, t in pairs(tracks) do
-		scanFloatKeys(t.pos)
-		scanFloatKeys(t.rot)
-	end
-	return maxTime
-end
+type AnimTransform = { pos: Vector3, rot: CFrame }
+type TrackFrames = { AnimTransform }
+type ClipData = { [string]: TrackFrames }
 
 -- =============================================================================
 -- Math: quaternion, quantization, hashing
@@ -223,6 +116,19 @@ local function cframeToQuat(cf: CFrame): (number, number, number, number)
 	end
 	local len = math.sqrt(x * x + y * y + z * z + w * w)
 	return x / len, y / len, z / len, w / len
+end
+
+local function quatToCFrame(x: number, y: number, z: number, w: number): CFrame
+	local len = math.sqrt(x * x + y * y + z * z + w * w)
+	if len == 0 then return CFrame.new() end
+	x, y, z, w = x / len, y / len, z / len, w / len
+	local xx, yy, zz = x * x, y * y, z * z
+	local xy, xz, yz = x * y, x * z, y * z
+	local wx, wy, wz = w * x, w * y, w * z
+	return CFrame.new(0, 0, 0,
+		1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy),
+		2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx),
+		2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy))
 end
 
 local function quantizeFloat(x: number, q: number): number
@@ -291,69 +197,46 @@ local function murmur3_32(str: string, seed: number?): number
 	return h1
 end
 
-local function quatToCFrame(x: number, y: number, z: number, w: number): CFrame
-	local len = math.sqrt(x * x + y * y + z * z + w * w)
-	if len == 0 then return CFrame.new() end
-	x, y, z, w = x / len, y / len, z / len, w / len
-	local xx, yy, zz = x * x, y * y, z * z
-	local xy, xz, yz = x * y, x * z, y * z
-	local wx, wy, wz = w * x, w * y, w * z
-	return CFrame.new(0, 0, 0,
-		1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy),
-		2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx),
-		2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy))
+-- =============================================================================
+-- Sample root-space pose at current animator state
+-- =============================================================================
+local function sampleRootSpacePose(): { [string]: AnimTransform }
+	local rootInv = hrp.CFrame:Inverse()
+	local out: { [string]: AnimTransform } = {}
+	for _, boneName in ipairs(R15_BONES) do
+		local part = character:FindFirstChild(boneName)
+		if part and part:IsA("BasePart") then
+			local cf = rootInv * part.CFrame
+			out[boneName] = { pos = cf.Position, rot = cf.Rotation }
+		else
+			out[boneName] = { pos = Vector3.zero, rot = CFrame.new() }
+		end
+	end
+	return out
 end
 
 -- =============================================================================
--- Canonicalize clip and hash
+-- Build ClipData by stepping the track (root-space, quantized)
 -- =============================================================================
-local R15_BONE_NAMES = {
-	"HumanoidRootPart", "LowerTorso", "UpperTorso", "Head",
-	"LeftUpperArm", "LeftLowerArm", "LeftHand",
-	"RightUpperArm", "RightLowerArm", "RightHand",
-	"LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
-	"RightUpperLeg", "RightLowerLeg", "RightFoot",
-}
+local quantPos = 1e-3
+local quantQuat = 1e-4
 
-local function buildTrackList(explicitOrder: { string }?): { string }
-	if explicitOrder and #explicitOrder > 0 then
-		return table.clone(explicitOrder)
-	end
-	return table.clone(R15_BONE_NAMES)
-end
-
-local function sampleTrackTransform(track: any, t: number): AnimTransform
-	if not track then
-		return { pos = Vector3.zero, rot = CFrame.new() }
-	end
-	return {
-		pos = getCurveValueAtTime(track.pos, t),
-		rot = getCurveValueAtTime(track.rot, t),
-	}
-end
-
-local function canonicalize(curveAnim: Instance, duration: number, params: FingerprintParams?): (ClipData, number, { string })
-	params = params or {}
-	local fps = params.FPS or 60
-	local quantPos = params.QuantPos or 1e-3
-	local quantQuat = params.QuantQuat or 1e-4
-	local durationMode = params.DurationMode or "NormalizeTo1"
-
-	local tracks = buildTrackList(params.TrackOrder)
-	local tracksCurves = getCurveTracks(curveAnim :: CurveAnimation)
+local function buildClipData(track: AnimationTrack, duration: number): (ClipData, number, { string })
+	local numFrames = math.max(1, math.floor(NORMALIZE_DURATION * FPS + 0.5))
+	local dt = NORMALIZE_DURATION / math.max(1, numFrames - 1)
 	local out: ClipData = {}
+	for _, bone in ipairs(R15_BONES) do
+		out[bone] = table.create(numFrames)
+	end
 
-	local normDuration = (durationMode == "NormalizeTo1") and 1.0 or duration
-	local numFrames = math.max(1, math.floor(normDuration * fps + 0.5))
-	local dt = normDuration / math.max(1, numFrames - 1)
-
-	for _, bone in ipairs(tracks) do
-		local frames: TrackFrames = table.create(numFrames)
-		for i = 0, numFrames - 1 do
-			local t = i * dt
-			local srcT = (durationMode == "NormalizeTo1") and (t * duration) or t
-			local trackCurve = tracksCurves[bone]
-			local fr = sampleTrackTransform(trackCurve, srcT)
+	for i = 0, numFrames - 1 do
+		local t = i * dt
+		local srcT = t * duration
+		track.TimePosition = srcT
+		animator:StepAnimations(0)
+		local pose = sampleRootSpacePose()
+		for _, bone in ipairs(R15_BONES) do
+			local fr = pose[bone]
 			local qx, qy, qz, qw = cframeToQuat(fr.rot)
 			qx = quantizeFloat(qx, quantQuat)
 			qy = quantizeFloat(qy, quantQuat)
@@ -362,16 +245,18 @@ local function canonicalize(curveAnim: Instance, duration: number, params: Finge
 			local px = quantizeFloat(fr.pos.X, quantPos)
 			local py = quantizeFloat(fr.pos.Y, quantPos)
 			local pz = quantizeFloat(fr.pos.Z, quantPos)
-			frames[i + 1] = {
+			out[bone][i + 1] = {
 				pos = Vector3.new(px, py, pz),
 				rot = quatToCFrame(qx, qy, qz, qw),
 			}
 		end
-		out[bone] = frames
 	end
-	return out, numFrames, tracks
+	return out, numFrames, R15_BONES
 end
 
+-- =============================================================================
+-- Serialize ClipData to bytes (same order as anim_dedup for stable hash)
+-- =============================================================================
 local function serializeClip(cs: ClipData, tracks: { string }): string
 	local chunks = {}
 	for _, bone in ipairs(tracks) do
@@ -391,23 +276,19 @@ local function serializeClip(cs: ClipData, tracks: { string }): string
 	return table.concat(chunks)
 end
 
-local function hashAnimation(curveAnim: Instance, duration: number, params: FingerprintParams?): (number, number)
-	local cs, _, tracks = canonicalize(curveAnim, duration, params)
+local function hashClipData(cs: ClipData, tracks: { string }): (number, number)
 	local bytes = serializeClip(cs, tracks)
 	return fnv1a32(bytes), murmur3_32(bytes)
 end
 
 -- =============================================================================
--- Extract animId and clipId from clip file path (works with / or \)
+-- Path and output helpers
 -- =============================================================================
 local function parseClipPath(path: string): (string?, string?)
 	local basename = path:match("([^/\\]+)$") or path
 	return basename:match("(%d+)%-(%d+)%.rbxm$")
 end
 
--- =============================================================================
--- Write duplicate groups to a file (sorted by group, then by anim ID)
--- =============================================================================
 local function writeDuplicateGroups(sortedGroups: { { string } }, outputPath: string)
 	local lines = {}
 	for _, group in ipairs(sortedGroups) do
@@ -429,9 +310,9 @@ local function sortGroupsForOutput(hashmap: { [string]: { string } }): { { strin
 end
 
 -- =============================================================================
--- Main: walk clips, hash, aggregate, write outputs
+-- Main: walk clips, play via Animator, hash pose data, write outputs
 -- =============================================================================
-print("anim_dedup: scanning", CLIPS_DIR)
+print("anim_dedup_pose: scanning", CLIPS_DIR)
 local hashmapFnv = {}
 local hashmapMurmur = {}
 local hashmapCombined = {}
@@ -439,48 +320,61 @@ local hashesCsvLines = {}
 local count = 0
 local skipped = 0
 
+local animation = Instance.new("Animation")
+
 for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRecursive) do
 	local path = fileData.Path
 	local instances = FileSystemService:LoadInstances(path)
 	local clip = instances and instances[1]
 
-	if not clip or not clip:IsA("CurveAnimation") then
+	if not clip then
 		skipped += 1
-		if clip then clip:Destroy() end
 		continue
 	end
 
-	local animId, clipId = parseClipPath(path)
-	if not animId or not clipId then
+	local okRegister, contentId = pcall(function()
+		return KeyframeSequenceProvider:RegisterKeyframeSequence(clip)
+	end)
+	if not okRegister or not contentId then
+		skipped += 1
 		clip:Destroy()
 		continue
 	end
 
-	local ok, err = pcall(function()
-		local duration = calculateCurveAnimLength(clip)
-		local clipHash, clipHash2 = hashAnimation(clip, duration, {
-			FPS = FPS,
-			DurationMode = DURATION_MODE,
-		})
+	animation.AnimationId = contentId
+	local track = animator:LoadAnimation(animation)
+	track:Play(0)
+	track.Looped = true
+	wait(0)
+	local duration = track.Length
+	local animId, clipId = parseClipPath(path)
+	if not animId or not clipId then
+		track:Stop(0)
+		track:Destroy()
+		clip:Destroy()
+		for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+			t:Stop(0)
+			t:Destroy()
+		end
+		animator:StepAnimations(0)
+		skipped += 1
+		continue
+	end
 
-		-- hashes.csv row
+	local okHash, err = pcall(function()
+		local cs, _, tracks = buildClipData(track, duration)
+		local clipHash, clipHash2 = hashClipData(cs, tracks)
 		table.insert(hashesCsvLines, animId .. "," .. clipId .. "," .. string.format("%.6f", duration) .. "," .. tostring(clipHash) .. "," .. tostring(clipHash2))
-
-		-- Group by FNV-1a
 		if hashmapFnv[clipHash] == nil then
 			hashmapFnv[clipHash] = { animId }
 		else
 			table.insert(hashmapFnv[clipHash], animId)
 		end
-
-		-- Group by Murmur3
 		if hashmapMurmur[clipHash2] == nil then
 			hashmapMurmur[clipHash2] = { animId }
 		else
 			table.insert(hashmapMurmur[clipHash2], animId)
 		end
-
-		-- Group by combined 64-bit
 		local key = string.format("%08X%08X", clipHash, clipHash2)
 		if hashmapCombined[key] == nil then
 			hashmapCombined[key] = { animId }
@@ -489,23 +383,36 @@ for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRec
 		end
 	end)
 
-	if not ok then
+	track:Stop(0)
+	track:Destroy()
+	clip:Destroy()
+	for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+		t:Stop(0)
+		t:Destroy()
+	end
+	animator:StepAnimations(0)
+
+	if not okHash then
 		warn("Hash failed:", path, err)
+		skipped += 1
+		continue
 	end
 
 	count += 1
 	if count % LOG_EVERY == 0 then
 		print(count, "clips hashed")
 	end
-	clip:Destroy()
+
+	-- if count > 1000 then
+	-- 	break
+	-- end
 end
 
--- Write hashes.csv (header + rows)
+-- Write outputs
 local hashesHeader = "animId,clipId,duration,hashFnv1a,hashMurmur\n"
 FileSystemService:WriteFile(HASHES_CSV, hashesHeader .. table.concat(hashesCsvLines, "\n"), Enum.FileMode.Text)
 print("Wrote", HASHES_CSV)
 
--- Sort and write duplicate groups
 local sortedFnv = sortGroupsForOutput(hashmapFnv)
 local sortedMurmur = sortGroupsForOutput(hashmapMurmur)
 local sortedCombined = sortGroupsForOutput(hashmapCombined)
@@ -524,4 +431,4 @@ for _, g in ipairs(sortedCombined) do if #g > 1 then dupCountCombined += 1 end e
 print("Wrote", DUPES_FNV, "| duplicate groups (FNV-1a):", dupCountFnv)
 print("Wrote", DUPES_MURMUR, "| duplicate groups (Murmur3):", dupCountMurmur)
 print("Wrote", DUPES_COMBINED, "| duplicate groups (combined):", dupCountCombined)
-print("Done. Processed:", count, "| Skipped (non-CurveAnimation):", skipped)
+print("Done. Processed:", count, "| Skipped:", skipped)
