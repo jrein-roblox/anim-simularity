@@ -21,8 +21,9 @@ from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score, silhouette_samples
 
-CSV_PATH = "fingerprints.csv"
+CSV_PATH = "ml_training/embeddings.csv"
 EMB_DIM = 128
+EMB_START_COL = 3
 OUT_DIR = "embedding_plots"
 MAX_POINTS_TSNE = 5000  # subsample for t-SNE (slow on 30k+)
 RANDOM_STATE = 42
@@ -38,7 +39,7 @@ def load_embeddings(path: str):
         reader = csv.reader(f)
         header = next(reader)
         for row in reader:
-            if len(row) < 4 + EMB_DIM:
+            if len(row) < EMB_START_COL + EMB_DIM:
                 continue
             anim_ids.append(row[0])
             try:
@@ -51,7 +52,7 @@ def load_embeddings(path: str):
                     return v if np.isfinite(v) else 0.0
                 except (ValueError, TypeError):
                     return 0.0
-            emb = [safe_float(x) for x in row[4 : 4 + EMB_DIM]]
+            emb = [safe_float(x) for x in row[EMB_START_COL : EMB_START_COL + EMB_DIM]]
             emb_list.append(emb)
     embeddings = np.array(emb_list, dtype=np.float64)
     return anim_ids, durations, embeddings

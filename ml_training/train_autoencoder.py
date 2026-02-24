@@ -183,7 +183,7 @@ def main():
     ap.add_argument("--T_max", type=int, default=T_MAX, help="Max frames per clip (input length)")
     ap.add_argument("--hidden", type=int, nargs="+", default=HIDDEN_DIMS, help="Hidden layer sizes")
     ap.add_argument("--latent", type=int, default=LATENT_DIM, help="Latent dimension")
-    ap.add_argument("--epochs", type=int, default=80, help="Training epochs")
+    ap.add_argument("--epochs", type=int, default=30, help="Training epochs")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val_ratio", type=float, default=0.2)
@@ -208,16 +208,19 @@ def main():
     n_val = int(N * args.val_ratio)
     val_idx = perm[:n_val]
     train_idx = perm[n_val:]
-    X_train = torch.from_numpy(X[train_idx]).float()
-    X_val = torch.from_numpy(X[val_idx]).float()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    model = AutoEncoder(input_dim, args.hidden, args.latent)
+    X_train = torch.from_numpy(X[train_idx]).float().to(device)
+    X_val = torch.from_numpy(X[val_idx]).float().to(device)
+
+    model = AutoEncoder(input_dim, args.hidden, args.latent).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     mse = nn.MSELoss()
 
     for ep in range(args.epochs):
         model.train()
-        perm_train = torch.randperm(X_train.size(0))
+        perm_train = torch.randperm(X_train.size(0), device=device)
         total_loss = 0.0
         n_batches = 0
         for i in range(0, X_train.size(0), args.batch_size):
@@ -240,6 +243,7 @@ def main():
 
     torch.save(model.state_dict(), os.path.join(checkpoint_dir, "autoencoder.pt"))
     torch.save(model.encoder.state_dict(), os.path.join(checkpoint_dir, "encoder.pt"))
+    model = model.cpu()
     # Export normalization for embed script
     np.savez(
         os.path.join(checkpoint_dir, "norm.npz"),
