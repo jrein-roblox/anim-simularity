@@ -19,6 +19,19 @@ HIDDEN_DIMS = [512, 256]
 LATENT_DIM = 128
 
 
+def _safe_float(s: str) -> float:
+    if not isinstance(s, str):
+        s = str(s)
+    s_lower = s.strip().lower()
+    if s_lower in ("nan", "-nan", "nan(ind)", "-nan(ind)", "inf", "-inf", "+inf", ""):
+        return 0.0
+    try:
+        x = float(s)
+        return 0.0 if not np.isfinite(x) else x
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def load_manifest(data_dir: str):
     manifest_path = os.path.join(data_dir, "manifest.csv")
     if not os.path.isfile(manifest_path):
@@ -29,12 +42,13 @@ def load_manifest(data_dir: str):
         next(reader)
         for row in reader:
             if len(row) >= 4:
-                rows.append((row[0], row[1], float(row[2]), int(row[3])))
+                nf = max(0, int(_safe_float(row[3])))
+                rows.append((row[0], row[1], _safe_float(row[2]), nf))
     return rows
 
 
 def load_clip_csv(path: str) -> np.ndarray:
-    """Load one clip CSV -> (T, 90)."""
+    """Load one clip CSV -> (T, 90). Replaces NaN/inf with 0."""
     data = []
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
@@ -42,10 +56,10 @@ def load_clip_csv(path: str) -> np.ndarray:
         for row in reader:
             if len(row) < 1 + FEAT_PER_FRAME:
                 continue
-            # frame index then 90 floats
-            row_floats = [float(row[i]) for i in range(1, 1 + FEAT_PER_FRAME)]
+            row_floats = [_safe_float(row[i]) for i in range(1, 1 + FEAT_PER_FRAME)]
             data.append(row_floats)
-    return np.array(data, dtype=np.float32) if data else np.zeros((0, FEAT_PER_FRAME), dtype=np.float32)
+    arr = np.array(data, dtype=np.float32) if data else np.zeros((0, FEAT_PER_FRAME), dtype=np.float32)
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
 
 def load_all_data(data_dir: str, manifest: list):
@@ -70,6 +84,7 @@ def load_all_data(data_dir: str, manifest: list):
         if not os.path.isfile(path):
             continue
         arr = load_clip_csv(path)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
         T = arr.shape[0]
         if T == 0:
             arr = np.zeros((T_MAX, FEAT_PER_FRAME), dtype=np.float32)

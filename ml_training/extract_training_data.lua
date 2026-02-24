@@ -128,6 +128,14 @@ local function buildClipDataFull(track: AnimationTrack, duration: number): (Clip
 	return out, numFrames, R15_BONES
 end
 
+-- Coerce to finite number so we never write -nan(ind) or inf to CSV
+local function safeNum(v: number): number
+	if v ~= v or v == math.huge or v == -math.huge then
+		return 0
+	end
+	return v
+end
+
 -- Build header: frame, then for each bone: px,py,pz,lx,ly,lz
 local function csvHeader(): string
 	local parts = { "frame" }
@@ -154,12 +162,12 @@ local function writeClipCSV(cs: ClipData, numFrames: number, tracks: { string },
 			local qx, qy, qz, qw = cframeToQuat(fr.rot)
 			qx, qy, qz, qw = quatHemisphereAlign(qx0, qy0, qz0, qw0, qx, qy, qz, qw)
 			local lx, ly, lz = quatLog(qx, qy, qz, qw)
-			table.insert(row, string.format("%.8f", px))
-			table.insert(row, string.format("%.8f", py))
-			table.insert(row, string.format("%.8f", pz))
-			table.insert(row, string.format("%.8f", lx))
-			table.insert(row, string.format("%.8f", ly))
-			table.insert(row, string.format("%.8f", lz))
+			table.insert(row, string.format("%.8f", safeNum(px)))
+			table.insert(row, string.format("%.8f", safeNum(py)))
+			table.insert(row, string.format("%.8f", safeNum(pz)))
+			table.insert(row, string.format("%.8f", safeNum(lx)))
+			table.insert(row, string.format("%.8f", safeNum(ly)))
+			table.insert(row, string.format("%.8f", safeNum(lz)))
 		end
 		table.insert(lines, table.concat(row, ","))
 	end

@@ -32,8 +32,16 @@ SKELETON_EDGES = [
 ]
 
 
+def _safe_float(s: str) -> float:
+    try:
+        x = float(s)
+        return 0.0 if not np.isfinite(x) else x
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def load_clip_csv(path: str) -> np.ndarray:
-    """Load clip CSV -> (T, 15, 3) positions only (px, py, pz per bone)."""
+    """Load clip CSV -> (T, 15, 3) positions only (px, py, pz per bone). NaN/inf replaced with 0."""
     rows = []
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
@@ -44,65 +52,46 @@ def load_clip_csv(path: str) -> np.ndarray:
             pos = []
             for b in range(15):
                 base = 1 + b * 6
-                px = float(row[base])
-                py = float(row[base + 1])
-                pz = float(row[base + 2])
+                px = _safe_float(row[base])
+                py = _safe_float(row[base + 1])
+                pz = _safe_float(row[base + 2])
                 pos.append([px, py, pz])
             rows.append(pos)
-    return np.array(rows, dtype=np.float64)
+    arr = np.array(rows, dtype=np.float64) if rows else np.zeros((0, 15, 3), dtype=np.float64)
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Render animated GIF of skeleton from a clip CSV")
-    ap.add_argument("csv_path", nargs="?", default=None, help="Path to clip CSV (e.g. ml_training/train_data/123-456.csv)")
-    ap.add_argument("--output", "-o", default="ml_training/skeleton_preview.gif", help="Output GIF path")
-    ap.add_argument("--fps", type=int, default=15, help="GIF frame rate (lower = smaller file)")
-    ap.add_argument("--dpi", type=int, default=80, help="Figure DPI")
-    ap.add_argument("--view", choices=["xy", "xz", "yz"], default="xy", help="2D view: xy=front, xz=top, yz=side")
-    args = ap.parse_args()
-
-    if args.csv_path is None:
-        data_dir = "ml_training/train_data"
-        if not os.path.isdir(data_dir):
-            raise SystemExit("No csv_path given and ml_training/train_data not found.")
-        files = [f for f in os.listdir(data_dir) if f.endswith(".csv") and f != "manifest.csv"]
-        if not files:
-            raise SystemExit("No clip CSVs in ml_training/train_data. Run extract_training_data.lua first.")
-        path = os.path.join(data_dir, files[0])
-        print(f"Using first clip: {path}")
-    else:
-        path = args.csv_path
-
-    if not os.path.isfile(path):
-        raise SystemExit(f"File not found: {path}")
-
+def render_one_gif(path: str, output_path: str, fps: int = 15, dpi: int = 80, view: str = "xy") -> bool:
+    """Render a single clip CSV to an animated GIF. Returns True on success."""
     data = load_clip_csv(path)
     T, _, _ = data.shape
     if T == 0:
-        raise SystemExit("No frames in CSV.")
+        return False
+    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
-    # 2D projection
-    if args.view == "xy":
+    if view == "xy":
         x_idx, y_idx = 0, 1
-    elif args.view == "xz":
+    elif view == "xz":
         x_idx, y_idx = 0, 2
     else:
         x_idx, y_idx = 1, 2
 
     x_all = data[:, :, x_idx]
     y_all = data[:, :, y_idx]
-    x_min, x_max = x_all.min(), x_all.max()
-    y_min, y_max = y_all.min(), y_all.max()
-    pad = 0.1
-    x_margin = max((x_max - x_min) * pad, 0.1)
-    y_margin = max((y_max - y_min) * pad, 0.1)
-    x_lim = (x_min - x_margin, x_max + x_margin)
-    y_lim = (y_min - y_margin, y_max + y_margin)
+    x_min, x_max = np.nanmin(x_all), np.nanmax(x_all)
+    y_min, y_max = np.nanmin(y_all), np.nanmax(y_all)
+    x_center = (x_min + x_max) / 2
+    y_center = (y_min + y_max) / 2
+    x_span = max(x_max - x_min, 1e-6)
+    y_span = max(y_max - y_min, 1e-6)
+    half_size = max(x_span, y_span, 6.0) / 2
+    x_lim = (x_center - half_size, x_center + half_size)
+    y_lim = (y_center - half_size, y_center + half_size)
 
     fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_aspect("equal")
     ax.set_xlim(x_lim)
     ax.set_ylim(y_lim)
-    ax.set_aspect("equal")
     ax.set_xlabel("X" if x_idx == 0 else "Y" if x_idx == 1 else "Z")
     ax.set_ylabel("Y" if y_idx == 1 else "Z")
     ax.set_title(os.path.basename(path))
@@ -124,18 +113,77 @@ def main():
         scatter.set_offsets(xy)
         segments = []
         for i, j in SKELETON_EDGES:
-            segments.append([(pos[i, x_idx], pos[i, y_idx]), (pos[j, x_idx], pos[j, y_idx])])
+            segments.append([(float(pos[i, x_idx]), float(pos[i, y_idx])), (float(pos[j, x_idx]), float(pos[j, y_idx]))])
         line_segs.set_segments(segments)
         frame_text.set_text(f"frame {frame + 1}/{T}")
         return scatter, line_segs, frame_text
 
     ani = animation.FuncAnimation(
-        fig, update, init_func=init, frames=T, interval=1000 / args.fps, blit=False
+        fig, update, init_func=init, frames=T, interval=1000 / fps, blit=False
     )
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    ani.save(args.output, writer="pillow", fps=args.fps, dpi=args.dpi)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    ani.save(output_path, writer="pillow", fps=fps, dpi=dpi)
     plt.close()
-    print(f"Saved {args.output} ({T} frames at {args.fps} fps)")
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Render animated GIF of skeleton from a clip CSV")
+    ap.add_argument("csv_path", nargs="?", default=None, help="Path to clip CSV (e.g. ml_training/train_data/123-456.csv)")
+    ap.add_argument("--output", "-o", default="ml_training/skeleton_preview.gif", help="Output GIF path (single mode)")
+    ap.add_argument("--out_dir", default="ml_training/skeleton_gifs", help="Output directory in recursive mode")
+    ap.add_argument("--recursive", "-r", action="store_true", help="Build GIFs for all CSV files in training directory")
+    ap.add_argument("--data_dir", default="ml_training/train_data", help="Training data directory (for recursive mode)")
+    ap.add_argument("--fps", type=int, default=15, help="GIF frame rate (lower = smaller file)")
+    ap.add_argument("--dpi", type=int, default=80, help="Figure DPI")
+    ap.add_argument("--view", choices=["xy", "xz", "yz"], default="xy", help="2D view: xy=front, xz=top, yz=side")
+    args = ap.parse_args()
+
+    if args.recursive:
+        data_dir = args.data_dir
+        if not os.path.isdir(data_dir):
+            raise SystemExit(f"Data directory not found: {data_dir}")
+        files = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv") and f != "manifest.csv"])
+        if not files:
+            raise SystemExit(f"No clip CSVs in {data_dir}. Run extract_training_data.lua first.")
+        os.makedirs(args.out_dir, exist_ok=True)
+        ok = 0
+        for i, f in enumerate(files):
+            path = os.path.join(data_dir, f)
+            base = os.path.splitext(f)[0]
+            out_path = os.path.join(args.out_dir, base + ".gif")
+            try:
+                if render_one_gif(path, out_path, fps=args.fps, dpi=args.dpi, view=args.view):
+                    ok += 1
+                    print(f"[{i + 1}/{len(files)}] {f} -> {out_path}")
+            except Exception as e:
+                print(f"[{i + 1}/{len(files)}] {f} skipped: {e}")
+        print(f"Done. Rendered {ok}/{len(files)} GIFs to {args.out_dir}")
+        return
+
+    if args.csv_path is None:
+        data_dir = args.data_dir
+        if not os.path.isdir(data_dir):
+            raise SystemExit("No csv_path given and ml_training/train_data not found.")
+        files = [f for f in os.listdir(data_dir) if f.endswith(".csv") and f != "manifest.csv"]
+        if not files:
+            raise SystemExit("No clip CSVs in ml_training/train_data. Run extract_training_data.lua first.")
+        path = os.path.join(data_dir, files[0])
+        print(f"Using first clip: {path}")
+    else:
+        path = args.csv_path
+
+    if not os.path.isfile(path):
+        raise SystemExit(f"File not found: {path}")
+
+    data = load_clip_csv(path)
+    T, _, _ = data.shape
+    if T == 0:
+        raise SystemExit("No frames in CSV.")
+    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+
+    if render_one_gif(path, args.output, fps=args.fps, dpi=args.dpi, view=args.view):
+        print(f"Saved {args.output} ({T} frames at {args.fps} fps)")
 
 
 if __name__ == "__main__":
