@@ -13,7 +13,7 @@ local InsertService = game:GetService("InsertService")
 
 -- Config
 local BASE_PATH = "C:\\git\\roblox\\jrein\\anim-simularity"
-local INPUT_CSV = BASE_PATH .. "\\animations.csv"   -- or animations_02-05-26.csv
+local INPUT_CSV = BASE_PATH .. "\\animations_02-23-26.csv"
 local ID_COLUMN = 1   -- 1-based: column index for catalog/asset ID
 local SKIP_HEADER = true   -- if true, skip first row (header)
 local LOG_EVERY = 100
