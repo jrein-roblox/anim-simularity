@@ -2,7 +2,7 @@ import csv
 import numpy as np
 
 CSV_PATH = "ml_training/embeddings.csv"
-THRESHOLD = 0.99
+THRESHOLD = 0.90
 EMB_START_COL = 3
 # ---------------------------------------------------------
 # 1. Load AnimIds + Embeddings
