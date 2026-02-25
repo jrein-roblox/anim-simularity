@@ -57,9 +57,12 @@ def main():
         labels = np.arange(N)
     else:
         ii, jj = zip(*edges)
-        ii = list(ii) + list(jj)
-        jj = list(jj) + list(ii)
-        adj = csr_matrix((np.ones(len(ii)), (ii, jj)), shape=(N, N))
+        ii = np.array(ii, dtype=np.int64)
+        jj = np.array(jj, dtype=np.int64)
+        # Symmetrize: for each (i,j) add (j,i)
+        ii_sym = np.concatenate([ii, jj])
+        jj_sym = np.concatenate([jj, ii])
+        adj = csr_matrix((np.ones(len(ii_sym)), (ii_sym, jj_sym)), shape=(N, N))
         n_components, labels = connected_components(adj, directed=False)
 
     # groups.csv: animId, clipId, duration, groupId
