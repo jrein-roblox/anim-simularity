@@ -73,7 +73,7 @@ def main():
             if T == 0:
                 arr = np.zeros((T_max, FEAT_PER_FRAME), dtype=np.float32)
             elif T < T_max:
-                pad = np.zeros((T_max - T, FEAT_PER_FRAME), dtype=np.float32)
+                pad = np.repeat(arr[-1:], T_max - T, axis=0)
                 arr = np.concatenate([arr, pad], axis=0)
             else:
                 if args.spread_frames:

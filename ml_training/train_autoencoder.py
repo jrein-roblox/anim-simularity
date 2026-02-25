@@ -90,7 +90,7 @@ def load_all_data(data_dir: str, manifest: list, t_max: int, spread_frames: bool
         if T == 0:
             arr = np.zeros((t_max, FEAT_PER_FRAME), dtype=np.float32)
         elif T < t_max:
-            pad = np.zeros((t_max - T, FEAT_PER_FRAME), dtype=np.float32)
+            pad = np.repeat(arr[-1:], t_max - T, axis=0)
             arr = np.concatenate([arr, pad], axis=0)
         elif T > t_max:
             if spread_frames:

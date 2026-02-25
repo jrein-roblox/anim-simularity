@@ -1,8 +1,9 @@
 import csv
 import numpy as np
 
-CSV_PATH = "fingerprints4.csv"
-THRESHOLD = 0.99
+CSV_PATH = "ml_training/embeddings.csv"
+THRESHOLD = 0.95
+EMB_START_COL = 3
 # ---------------------------------------------------------
 # 1. Load AnimIds + Embeddings
 # ---------------------------------------------------------
@@ -19,7 +20,7 @@ with open(CSV_PATH, newline='', encoding="utf-8") as f:
         anim_ids.append(row[0])  # AnimId
         durations[row[0]] = float(row[2])# Duration
         
-        emb = np.array([float(x) for x in row[4:4+128]], dtype=np.float32)
+        emb = np.array([float(x) for x in row[EMB_START_COL:EMB_START_COL+128]], dtype=np.float32)
         emb_list.append(emb)
 
 embeddings = np.vstack(emb_list)
@@ -41,7 +42,7 @@ normed = embeddings / np.maximum(norms, 1e-8)
 # RESULTS[AnimId] = [(OtherAnimId, similarity), ...]
 RESULTS = {aid: [] for aid in anim_ids}
 
-BATCH = 30000
+BATCH = 40000
 
 for i in range(0, N, BATCH):
     end_i = min(i + BATCH, N)
@@ -87,8 +88,8 @@ with open("similar_anim_ids4.txt", "w", encoding="utf-8") as out:
         for other_id, sim in sims:         
             duration2 = durations[other_id]
             pair = (other_id, aid)
-            if pair in found or abs(duration1 - duration2) > 2.5:
-                continue
+            #if pair in found or abs(duration1 - duration2) > 2.5:
+            #    continue
                 
             line = line + f"    https://www.roblox.com/catalog/{other_id} {sim:.6f} {duration2:.2f}\n"      
             found[(aid, other_id)] = sim
@@ -98,4 +99,4 @@ with open("similar_anim_ids4.txt", "w", encoding="utf-8") as out:
             out.write(line)
             out.write("\n")
 
-print("Done: similar_anim_ids.txt generated")
+print("Done: similar_anim_ids4.txt generated")
