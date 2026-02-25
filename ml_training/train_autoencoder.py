@@ -225,6 +225,26 @@ class AutoEncoder(nn.Module):
         return self.decoder(z), z
 
 
+def infonce_loss(z: torch.Tensor, z_aug: torch.Tensor, tau: float = 0.07) -> torch.Tensor:
+    """
+    InfoNCE contrastive loss. z and z_aug are (B, L) latents for two views of the same batch.
+    For anchor z_i the positive is z_aug_i; negatives are all other 2B-2 samples.
+    Expects z and z_aug to be L2-normalized (done inside for safety).
+    """
+    z = z / (z.norm(dim=1, keepdim=True) + 1e-8)
+    z_aug = z_aug / (z_aug.norm(dim=1, keepdim=True) + 1e-8)
+    B = z.size(0)
+    # Stack into (2B, L); rows 0..B-1 are z, rows B..2B-1 are z_aug
+    features = torch.cat([z, z_aug], dim=0)
+    logits = (features @ features.T) / tau
+    # Mask self-similarity to avoid trivial solution
+    mask = torch.eye(2 * B, device=z.device, dtype=torch.bool)
+    logits = logits.masked_fill(mask, -1e9)
+    # For anchor i (0..B-1) positive is B+i; for anchor B+i positive is i
+    labels = torch.cat([torch.arange(B, 2 * B, device=z.device), torch.arange(B, device=z.device)])
+    return nn.functional.cross_entropy(logits, labels)
+
+
 def export_encoder_weights_lua(encoder: Encoder, out_path: str, t_max: int):
     """Write encoder weights to a Lua file that returns a table. Each layer: weight[out][in], bias[out]."""
     linear_layers = [m for m in encoder.net if isinstance(m, nn.Linear)]
@@ -270,6 +290,9 @@ def main():
     ap.add_argument("--lr_step", type=int, default=25, help="For step scheduler: reduce LR every this many epochs")
     ap.add_argument("--lr_gamma", type=float, default=0.5, help="Multiply LR by this factor when scheduler steps")
     ap.add_argument("--lr_milestones", type=int, nargs="+", default=[25, 50, 75], help="For multistep scheduler: epochs at which to reduce LR")
+    ap.add_argument("--infonce_weight", type=float, default=0.1, help="Weight for InfoNCE contrastive loss (0 to disable)")
+    ap.add_argument("--infonce_tau", type=float, default=0.07, help="Temperature for InfoNCE")
+    ap.add_argument("--infonce_noise", type=float, default=0.02, help="Std of Gaussian noise for contrastive augmentation")
     args = ap.parse_args()
 
     data_dir = args.data_dir
@@ -313,6 +336,8 @@ def main():
     else:
         scheduler = None
     mse = nn.MSELoss()
+    if args.infonce_weight > 0:
+        print(f"InfoNCE: weight={args.infonce_weight}, tau={args.infonce_tau}, noise_std={args.infonce_noise}")
 
     for ep in range(args.epochs):
         model.train()
@@ -322,8 +347,12 @@ def main():
         for i in range(0, X_train.size(0), args.batch_size):
             idx = perm_train[i : i + args.batch_size]
             batch = X_train[idx]
-            recon, _ = model(batch)
+            recon, z = model(batch)
             loss = mse(recon, batch[:, :frame_dim])
+            if args.infonce_weight > 0 and batch.size(0) > 1:
+                batch_aug = batch + args.infonce_noise * torch.randn_like(batch, device=batch.device)
+                z_aug = model.encoder(batch_aug)
+                loss = loss + args.infonce_weight * infonce_loss(z, z_aug, tau=args.infonce_tau)
             opt.zero_grad()
             loss.backward()
             opt.step()
