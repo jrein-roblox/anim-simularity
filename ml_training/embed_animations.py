@@ -20,7 +20,7 @@ def main():
     ap.add_argument("--data_dir", default="ml_training/train_data")
     ap.add_argument("--checkpoint_dir", default="ml_training/checkpoints")
     ap.add_argument("--output", default="ml_training/embeddings.csv")
-    ap.add_argument("--spread_frames", action="store_true", help="Sample T_max frames across clip (use if model was trained with --spread_frames)")
+    ap.add_argument("--spread_frames", default=True, action="store_true", help="Sample T_max frames across clip (use if model was trained with --spread_frames)")
     args = ap.parse_args()
 
     ckpt_dir = args.checkpoint_dir
@@ -57,6 +57,7 @@ def main():
                     arr = load_clip_csv(path)
                     manifest.append((parts[0], parts[1], 0.0, arr.shape[0]))
 
+    count = 0
     rows = []
     with torch.no_grad():
         for item in manifest:
@@ -86,6 +87,9 @@ def main():
             z = encoder(torch.from_numpy(x)).numpy()[0]
             row = [anim_id, clip_id, f"{duration:.6f}"] + [f"{z[i]:.8f}" for i in range(len(z))]
             rows.append(row)
+            count += 1
+            if count % 1000 == 0:
+                print(f"Processed {count} clips")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", newline="", encoding="utf-8") as f:

@@ -190,7 +190,7 @@ def main():
     ap.add_argument("--T_max", type=int, default=T_MAX, help="Max frames per clip (input length)")
     ap.add_argument("--hidden", type=int, nargs="+", default=HIDDEN_DIMS, help="Hidden layer sizes")
     ap.add_argument("--latent", type=int, default=LATENT_DIM, help="Latent dimension")
-    ap.add_argument("--epochs", type=int, default=30, help="Training epochs")
+    ap.add_argument("--epochs", type=int, default=80, help="Training epochs")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val_ratio", type=float, default=0.2)
