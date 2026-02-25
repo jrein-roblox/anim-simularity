@@ -1,6 +1,7 @@
 --!strict
 -- Load encoder weights (from encoder_weights.lua) and run MLP forward to get embedding.
--- Input: vector of length T_max * 90 (pose sequence, padded if needed).
+-- Input: pose vector of length T_max * 90 (pose sequence, padded if needed). If encoder
+-- was trained with energy, we append 15 per-bone energy values (accumulated delta pos + quatlog).
 -- Output: embedding vector (latentDim).
 
 local WEIGHTS_PATH = "ml_training/checkpoints/encoder_weights.lua"
@@ -49,16 +50,54 @@ local function loadWeights(path: string): any
 	return fn()
 end
 
--- Build embedding for a clip: clipData is (T_max * 90) float array (pad with 0 if shorter).
+local FEAT_PER_FRAME = 90
+local NUM_BONES = 15
+local ENERGY_DIM = 15
+
+-- Per-bone energy: sum of frame-to-frame L2(delta pos) + L2(delta quatlog). poseVector length T_max*90.
+local function computeBoneEnergy(poseVector: { number }, T_max: number): { number }
+	local energy: { number } = table.create(ENERGY_DIM, 0)
+	if T_max < 2 then
+		return energy
+	end
+	for b = 0, NUM_BONES - 1 do
+		local base = b * 6
+		local sumPos, sumQuat = 0.0, 0.0
+		for t = 1, T_max - 1 do
+			local i0 = (t - 1) * FEAT_PER_FRAME + base
+			local i1 = t * FEAT_PER_FRAME + base
+			local dx = poseVector[i1 + 1] - poseVector[i0 + 1]
+			local dy = poseVector[i1 + 2] - poseVector[i0 + 2]
+			local dz = poseVector[i1 + 3] - poseVector[i0 + 3]
+			sumPos = sumPos + math.sqrt(dx * dx + dy * dy + dz * dz)
+			local lx = poseVector[i1 + 4] - poseVector[i0 + 4]
+			local ly = poseVector[i1 + 5] - poseVector[i0 + 5]
+			local lz = poseVector[i1 + 6] - poseVector[i0 + 6]
+			sumQuat = sumQuat + math.sqrt(lx * lx + ly * ly + lz * lz)
+		end
+		energy[b + 1] = sumPos + sumQuat
+	end
+	return energy
+end
+
+-- Build embedding for a clip: poseVector is (T_max * 90) float array (pad with 0 if shorter).
+-- If encoder was trained with energy (inputDim == T_max*90+15), we compute and append energy.
 -- Returns embedding as array of length latentDim.
 local function buildEmbeddingFromPoseVector(poseVector: { number }, weightsPath: string?): { number }
 	local path = weightsPath or WEIGHTS_PATH
 	local w = loadWeights(path)
 	local T_max = w.T_max
-	local expectedLen = T_max * 90
-	local inputVec: { number } = table.create(expectedLen, 0)
-	for i = 1, math.min(#poseVector, expectedLen) do
+	local frameLen = T_max * FEAT_PER_FRAME
+	local inputDim = w.inputDim
+	local inputVec: { number } = table.create(inputDim, 0)
+	for i = 1, math.min(#poseVector, frameLen) do
 		inputVec[i] = poseVector[i]
+	end
+	if inputDim > frameLen then
+		local energy = computeBoneEnergy(inputVec, T_max)
+		for i = 1, ENERGY_DIM do
+			inputVec[frameLen + i] = energy[i]
+		end
 	end
 	return encoderForward(w, inputVec)
 end

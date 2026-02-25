@@ -114,9 +114,9 @@ local function buildClipDataFull(track: AnimationTrack, duration: number): (Clip
 	for _, bone in ipairs(R15_BONES) do
 		out[bone] = table.create(numFrames)
 	end
-	for i = 0, numFrames - 1 do
+	for i = 0, numFrames do
 		local t = (i + 0.5) / FPS
-		if t > duration then break end
+		--if t > duration then break end
 		local srcT = math.min(t, duration - 1e-6)
 		track.TimePosition = srcT
 		animator:StepAnimations(0)
@@ -150,11 +150,11 @@ local function csvHeader(): string
 	return table.concat(parts, ",")
 end
 
--- Write one clip CSV and return numFrames.
+-- Write one clip CSV and return numFrames. Always write at least one frame (i = 1 .. numFrames).
 local function writeClipCSV(cs: ClipData, numFrames: number, tracks: { string }, filePath: string): number
 	local lines = { csvHeader() }
 	local qx0, qy0, qz0, qw0 = cframeToQuat(cs[tracks[1]][1].rot)
-	for i = 1, numFrames - 1 do
+	for i = 1, numFrames do
 		local row = { tostring(i - 1) }
 		for _, bone in ipairs(tracks) do
 			local fr = cs[bone][i]

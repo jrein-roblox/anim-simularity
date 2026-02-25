@@ -7,13 +7,16 @@ import argparse
 import csv
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 # Defaults (must match Lua inference)
-FEAT_PER_FRAME = 90
+FEAT_PER_FRAME = 90  # 15 bones × 6 (pos xyz + quatlog xyz)
+NUM_BONES = 15
+ENERGY_DIM = 15  # accumulated delta pos + quatlog per bone
 T_MAX = 90
 HIDDEN_DIMS = [512, 256]
 LATENT_DIM = 128
@@ -48,23 +51,97 @@ def load_manifest(data_dir: str):
 
 
 def load_clip_csv(path: str) -> np.ndarray:
-    """Load one clip CSV -> (T, 90). Replaces NaN/inf with 0."""
-    data = []
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        for row in reader:
-            if len(row) < 1 + FEAT_PER_FRAME:
-                continue
-            row_floats = [_safe_float(row[i]) for i in range(1, 1 + FEAT_PER_FRAME)]
-            data.append(row_floats)
-    arr = np.array(data, dtype=np.float32) if data else np.zeros((0, FEAT_PER_FRAME), dtype=np.float32)
+    """Load one clip CSV -> (T, 90). Replaces NaN/inf with 0. Uses numpy for fast parsing."""
+    try:
+        # usecols 1..90 (skip frame index col 0); invalid/NaN -> 0 via filling_values
+        arr = np.genfromtxt(
+            path,
+            delimiter=",",
+            skip_header=1,
+            usecols=range(1, 1 + FEAT_PER_FRAME),
+            dtype=np.float32,
+            filling_values=0.0,
+            invalid_raise=False,
+            encoding="utf-8",
+        )
+    except Exception:
+        arr = np.zeros((0, FEAT_PER_FRAME), dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    elif arr.size == 0:
+        arr = np.zeros((0, FEAT_PER_FRAME), dtype=np.float32)
+    # Ensure exactly FEAT_PER_FRAME columns (pad or truncate) so all clips stack
+    if arr.shape[1] < FEAT_PER_FRAME:
+        pad = np.zeros((arr.shape[0], FEAT_PER_FRAME - arr.shape[1]), dtype=np.float32)
+        arr = np.hstack([arr, pad])
+    elif arr.shape[1] > FEAT_PER_FRAME:
+        arr = arr[:, :FEAT_PER_FRAME]
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
 
-def load_all_data(data_dir: str, manifest: list, t_max: int, spread_frames: bool = True):
-    """Load all clips; pad/truncate or sample to (N, t_max, 90); flatten to (N, t_max*90).
-    If spread_frames is True and clip has T > t_max, sample t_max frames uniformly across the clip duration."""
+def compute_bone_energy(arr: np.ndarray) -> np.ndarray:
+    """Per-bone energy: sum of frame-to-frame L2 delta (pos) + L2 delta (quatlog). arr (T, 90) -> (15,)."""
+    T = arr.shape[0]
+    out = np.zeros(ENERGY_DIM, dtype=np.float32)
+    if T < 2:
+        return out
+    for b in range(NUM_BONES):
+        pos = arr[:, b * 6 : b * 6 + 3]
+        quat = arr[:, b * 6 + 3 : b * 6 + 6]
+        dpos = np.diff(pos, axis=0)
+        dquat = np.diff(quat, axis=0)
+        out[b] = np.sqrt((dpos ** 2).sum(axis=1)).sum() + np.sqrt((dquat ** 2).sum(axis=1)).sum()
+    return out
+
+
+def _load_one_clip(args_tuple):
+    """Worker: (data_dir, item, t_max, spread_frames) -> (frames_arr, energy) or None."""
+    data_dir, item, t_max, spread_frames = args_tuple
+    if len(item) == 4:
+        anim_id, clip_id = item[0], item[1]
+    else:
+        anim_id, clip_id = item[0], item[1]
+    path = os.path.join(data_dir, f"{anim_id}-{clip_id}.csv")
+    if not os.path.isfile(path):
+        return None
+    arr = load_clip_csv(path)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+    energy = compute_bone_energy(arr)
+    T = arr.shape[0]
+    if T == 0:
+        arr = np.zeros((t_max, FEAT_PER_FRAME), dtype=np.float32)
+    elif T < t_max:
+        pad = np.repeat(arr[-1:], t_max - T, axis=0)
+        arr = np.concatenate([arr, pad], axis=0)
+    elif T > t_max:
+        if spread_frames:
+            indices = np.linspace(0, T - 1, t_max, dtype=np.int64)
+            arr = arr[indices]
+        else:
+            arr = arr[:t_max]
+    # Guarantee shape (t_max, FEAT_PER_FRAME) so np.stack never fails
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.shape[0] != t_max or arr.shape[1] != FEAT_PER_FRAME:
+        out = np.zeros((t_max, FEAT_PER_FRAME), dtype=np.float32)
+        r = min(arr.shape[0], t_max)
+        c = min(arr.shape[1], FEAT_PER_FRAME)
+        out[:r, :c] = arr[:r, :c]
+        if r < t_max and r > 0:
+            out[r:] = np.repeat(out[r - 1 : r], t_max - r, axis=0)
+        arr = out
+    return (arr, energy)
+
+
+def load_all_data(
+    data_dir: str,
+    manifest: list,
+    t_max: int,
+    spread_frames: bool = True,
+    num_workers: int = 0,
+):
+    """Load all clips; pad/truncate or sample to (N, t_max, 90); compute per-bone energy from raw clip;
+    flatten frames to (N, t_max*90) and concat energy -> (N, t_max*90+15).
+    If num_workers > 0, load CSVs in parallel."""
     if not manifest:
         # Fallback: glob *-*.csv (skip manifest.csv)
         manifest = []
@@ -75,38 +152,31 @@ def load_all_data(data_dir: str, manifest: list, t_max: int, spread_frames: bool
                     path = os.path.join(data_dir, f)
                     arr = load_clip_csv(path)
                     manifest.append((m[0], m[1], 0.0, arr.shape[0]))
-    X_list = []
-    for item in manifest:
-        if len(item) == 4:
-            anim_id, clip_id, duration, num_frames = item
-        else:
-            anim_id, clip_id = item[0], item[1]
-        path = os.path.join(data_dir, f"{anim_id}-{clip_id}.csv")
-        if not os.path.isfile(path):
-            continue
-        arr = load_clip_csv(path)
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
-        T = arr.shape[0]
-        if T == 0:
-            arr = np.zeros((t_max, FEAT_PER_FRAME), dtype=np.float32)
-        elif T < t_max:
-            pad = np.repeat(arr[-1:], t_max - T, axis=0)
-            arr = np.concatenate([arr, pad], axis=0)
-        elif T > t_max:
-            if spread_frames:
-                indices = np.linspace(0, T - 1, t_max, dtype=np.int64)
-                arr = arr[indices]
-            else:
-                arr = arr[:t_max]
-        else:
-            pass
-        X_list.append(arr)
-    if not X_list:
+    work = [(data_dir, item, t_max, spread_frames) for item in manifest]
+    if num_workers and num_workers > 0:
+        frame_list = []
+        energy_list = []
+        with ThreadPoolExecutor(max_workers=num_workers) as ex:
+            for result in ex.map(_load_one_clip, work):
+                if result is not None:
+                    frame_list.append(result[0])
+                    energy_list.append(result[1])
+    else:
+        frame_list = []
+        energy_list = []
+        for w in work:
+            result = _load_one_clip(w)
+            if result is not None:
+                frame_list.append(result[0])
+                energy_list.append(result[1])
+    if not frame_list:
         raise SystemExit("No clips loaded. Run extract_training_data.lua first.")
-    X = np.stack(X_list, axis=0)
-    N, _, _ = X.shape
-    X_flat = X.reshape(N, -1)
-    return X_flat
+    X_frames = np.stack(frame_list, axis=0)
+    X_energy = np.stack(energy_list, axis=0)
+    N = X_frames.shape[0]
+    frame_dim = t_max * FEAT_PER_FRAME
+    X = np.concatenate([X_frames.reshape(N, -1), X_energy], axis=1)
+    return X, frame_dim
 
 
 class Encoder(nn.Module):
@@ -145,10 +215,10 @@ class Decoder(nn.Module):
 
 
 class AutoEncoder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: list, latent_dim: int):
+    def __init__(self, input_dim: int, frame_dim: int, hidden_dims: list, latent_dim: int):
         super().__init__()
         self.encoder = Encoder(input_dim, hidden_dims, latent_dim)
-        self.decoder = Decoder(latent_dim, hidden_dims, input_dim)
+        self.decoder = Decoder(latent_dim, hidden_dims, frame_dim)
 
     def forward(self, x):
         z = self.encoder(x)
@@ -159,7 +229,7 @@ def export_encoder_weights_lua(encoder: Encoder, out_path: str, t_max: int):
     """Write encoder weights to a Lua file that returns a table. Each layer: weight[out][in], bias[out]."""
     linear_layers = [m for m in encoder.net if isinstance(m, nn.Linear)]
     lines = [
-        "-- Encoder weights (auto-generated); input dim = T_max * 90, ReLU hidden, linear out.",
+        "-- Encoder weights (auto-generated); input = T_max*90 frame features + 15 per-bone energy (if used).",
         "return {",
         f"  T_max = {t_max},",
         f"  inputDim = {encoder.input_dim},",
@@ -195,16 +265,28 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val_ratio", type=float, default=0.2)
     ap.add_argument("--spread_frames", action="store_true", default=True, help="When clip is longer than T_max, sample T_max frames uniformly across duration instead of taking the first T_max")
+    ap.add_argument("--workers", type=int, default=8, help="Number of parallel workers for loading CSVs (0 = single-threaded)")
+    ap.add_argument("--scheduler", choices=["none", "step", "multistep"], default="step", help="LR scheduler: step (every N epochs), multistep (at milestones), none")
+    ap.add_argument("--lr_step", type=int, default=25, help="For step scheduler: reduce LR every this many epochs")
+    ap.add_argument("--lr_gamma", type=float, default=0.5, help="Multiply LR by this factor when scheduler steps")
+    ap.add_argument("--lr_milestones", type=int, nargs="+", default=[25, 50, 75], help="For multistep scheduler: epochs at which to reduce LR")
     args = ap.parse_args()
 
     data_dir = args.data_dir
     checkpoint_dir = args.checkpoint_dir
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    print("Loading manifest with {} workers".format(args.workers))
     manifest = load_manifest(data_dir)
-    X = load_all_data(data_dir, manifest, t_max=args.T_max, spread_frames=args.spread_frames)
+    X, frame_dim = load_all_data(
+        data_dir,
+        manifest,
+        t_max=args.T_max,
+        spread_frames=args.spread_frames,
+        num_workers=args.workers,
+    )
     N, input_dim = X.shape
-    print(f"Loaded {N} clips, input_dim={input_dim}")
+    print(f"Loaded {N} clips, input_dim={input_dim} (frame_dim={frame_dim}, energy={ENERGY_DIM})")
 
     # Normalize (optional): use mean/std of training set
     mean = X.mean(axis=0, keepdims=True)
@@ -222,8 +304,14 @@ def main():
     X_train = torch.from_numpy(X[train_idx]).float().to(device)
     X_val = torch.from_numpy(X[val_idx]).float().to(device)
 
-    model = AutoEncoder(input_dim, args.hidden, args.latent).to(device)
+    model = AutoEncoder(input_dim, frame_dim, args.hidden, args.latent).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if args.scheduler == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=args.lr_step, gamma=args.lr_gamma)
+    elif args.scheduler == "multistep":
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=args.lr_milestones, gamma=args.lr_gamma)
+    else:
+        scheduler = None
     mse = nn.MSELoss()
 
     for ep in range(args.epochs):
@@ -235,19 +323,22 @@ def main():
             idx = perm_train[i : i + args.batch_size]
             batch = X_train[idx]
             recon, _ = model(batch)
-            loss = mse(recon, batch)
+            loss = mse(recon, batch[:, :frame_dim])
             opt.zero_grad()
             loss.backward()
             opt.step()
             total_loss += loss.item()
             n_batches += 1
+        if scheduler is not None:
+            scheduler.step()
         train_loss = total_loss / max(n_batches, 1)
         model.eval()
         with torch.no_grad():
             recon_val, _ = model(X_val)
-            val_loss = mse(recon_val, X_val).item()
-        if (ep + 1) % 10 == 0 or ep == 0:
-            print(f"Epoch {ep + 1}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}")
+            val_loss = mse(recon_val, X_val[:, :frame_dim]).item()
+        lr_str = f"  lr={opt.param_groups[0]['lr']:.2e}" if scheduler else ""
+        if (ep + 1) % 1 == 0 or ep == 0:
+            print(f"Epoch {ep + 1}/{args.epochs}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}{lr_str}")
 
     torch.save(model.state_dict(), os.path.join(checkpoint_dir, "autoencoder.pt"))
     torch.save(model.encoder.state_dict(), os.path.join(checkpoint_dir, "encoder.pt"))
@@ -259,6 +350,8 @@ def main():
         std=std.astype(np.float32),
         T_max=args.T_max,
         input_dim=input_dim,
+        frame_dim=frame_dim,
+        energy_dim=ENERGY_DIM,
         latent_dim=args.latent,
         hidden_dims=np.array(args.hidden),
     )

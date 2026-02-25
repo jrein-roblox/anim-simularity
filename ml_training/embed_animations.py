@@ -11,7 +11,14 @@ import torch
 
 # Import same model as train_autoencoder
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from train_autoencoder import Encoder, load_clip_csv, load_manifest, FEAT_PER_FRAME
+from train_autoencoder import (
+    Encoder,
+    load_clip_csv,
+    load_manifest,
+    compute_bone_energy,
+    FEAT_PER_FRAME,
+    ENERGY_DIM,
+)
 
 
 def main():
@@ -32,6 +39,8 @@ def main():
     norm = np.load(norm_path, allow_pickle=True)
     T_max = int(norm["T_max"])
     input_dim = int(norm["input_dim"])
+    frame_dim = int(norm.get("frame_dim", input_dim))
+    use_energy = frame_dim < input_dim
     latent_dim = int(norm["latent_dim"])
     h = norm.get("hidden_dims")
     if h is not None and getattr(h, "size", 0) > 0:
@@ -70,6 +79,8 @@ def main():
             if not os.path.isfile(path):
                 continue
             arr = load_clip_csv(path)
+            if use_energy:
+                energy = compute_bone_energy(arr).reshape(1, -1)
             T = arr.shape[0]
             if T == 0:
                 arr = np.zeros((T_max, FEAT_PER_FRAME), dtype=np.float32)
@@ -83,6 +94,8 @@ def main():
                 else:
                     arr = arr[:T_max]
             x = arr.reshape(1, -1).astype(np.float32)
+            if use_energy:
+                x = np.concatenate([x, energy], axis=1)
             x = (x - mean) / std
             z = encoder(torch.from_numpy(x)).numpy()[0]
             row = [anim_id, clip_id, f"{duration:.6f}"] + [f"{z[i]:.8f}" for i in range(len(z))]
