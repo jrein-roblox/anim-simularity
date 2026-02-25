@@ -2,7 +2,7 @@ import csv
 import numpy as np
 
 CSV_PATH = "ml_training/embeddings.csv"
-THRESHOLD = 0.95
+THRESHOLD = 0.99
 EMB_START_COL = 3
 # ---------------------------------------------------------
 # 1. Load AnimIds + Embeddings
@@ -77,7 +77,7 @@ for aid in RESULTS:
 # 5. Write results
 # ---------------------------------------------------------
 found = {}
-with open("similar_anim_ids4.txt", "w", encoding="utf-8") as out:
+with open("similar_autoencoder.txt", "w", encoding="utf-8") as out:
     for aid in anim_ids:
         sims = RESULTS[aid]
         if not sims:
@@ -88,8 +88,8 @@ with open("similar_anim_ids4.txt", "w", encoding="utf-8") as out:
         for other_id, sim in sims:         
             duration2 = durations[other_id]
             pair = (other_id, aid)
-            #if pair in found or abs(duration1 - duration2) > 2.5:
-            #    continue
+            if pair in found:# or abs(duration1 - duration2) > 2.5:
+                continue
                 
             line = line + f"    https://www.roblox.com/catalog/{other_id} {sim:.6f} {duration2:.2f}\n"      
             found[(aid, other_id)] = sim
@@ -99,4 +99,28 @@ with open("similar_anim_ids4.txt", "w", encoding="utf-8") as out:
             out.write(line)
             out.write("\n")
 
-print("Done: similar_anim_ids4.txt generated")
+print("Done: similar_autoencoder.txt generated")
+
+found = {}
+with open("dupes_autoencoder.txt", "w", encoding="utf-8") as out:
+    for aid in anim_ids:
+        sims = RESULTS[aid]
+        if not sims:
+            continue
+
+        line = ""
+        for other_id, sim in sims:         
+            pair = (other_id, aid)
+            if pair in found:# or abs(duration1 - duration2) > 2.5:
+                continue
+                
+            line = line + f",{other_id}"      
+            found[(aid, other_id)] = sim
+        
+        if len(line) > 0:          
+            out.write(f"{aid}")
+            out.write(line)
+            out.write("\n")
+
+print("Done: dupes_autoencoder.txt generated")
+
