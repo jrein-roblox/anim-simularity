@@ -62,8 +62,9 @@ def load_clip_csv(path: str) -> np.ndarray:
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
 
-def load_all_data(data_dir: str, manifest: list):
-    """Load all clips; pad/truncate to (N, T_max, 90); flatten to (N, T_max*90)."""
+def load_all_data(data_dir: str, manifest: list, t_max: int, spread_frames: bool = True):
+    """Load all clips; pad/truncate or sample to (N, t_max, 90); flatten to (N, t_max*90).
+    If spread_frames is True and clip has T > t_max, sample t_max frames uniformly across the clip duration."""
     if not manifest:
         # Fallback: glob *-*.csv (skip manifest.csv)
         manifest = []
@@ -87,12 +88,18 @@ def load_all_data(data_dir: str, manifest: list):
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
         T = arr.shape[0]
         if T == 0:
-            arr = np.zeros((T_MAX, FEAT_PER_FRAME), dtype=np.float32)
-        elif T < T_MAX:
-            pad = np.zeros((T_MAX - T, FEAT_PER_FRAME), dtype=np.float32)
+            arr = np.zeros((t_max, FEAT_PER_FRAME), dtype=np.float32)
+        elif T < t_max:
+            pad = np.zeros((t_max - T, FEAT_PER_FRAME), dtype=np.float32)
             arr = np.concatenate([arr, pad], axis=0)
+        elif T > t_max:
+            if spread_frames:
+                indices = np.linspace(0, T - 1, t_max, dtype=np.int64)
+                arr = arr[indices]
+            else:
+                arr = arr[:t_max]
         else:
-            arr = arr[:T_MAX]
+            pass
         X_list.append(arr)
     if not X_list:
         raise SystemExit("No clips loaded. Run extract_training_data.lua first.")
@@ -187,6 +194,7 @@ def main():
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val_ratio", type=float, default=0.2)
+    ap.add_argument("--spread_frames", action="store_true", default=True, help="When clip is longer than T_max, sample T_max frames uniformly across duration instead of taking the first T_max")
     args = ap.parse_args()
 
     data_dir = args.data_dir
@@ -194,7 +202,7 @@ def main():
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     manifest = load_manifest(data_dir)
-    X = load_all_data(data_dir, manifest)
+    X = load_all_data(data_dir, manifest, t_max=args.T_max, spread_frames=args.spread_frames)
     N, input_dim = X.shape
     print(f"Loaded {N} clips, input_dim={input_dim}")
 

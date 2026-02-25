@@ -20,6 +20,7 @@ def main():
     ap.add_argument("--data_dir", default="ml_training/train_data")
     ap.add_argument("--checkpoint_dir", default="ml_training/checkpoints")
     ap.add_argument("--output", default="ml_training/embeddings.csv")
+    ap.add_argument("--spread_frames", action="store_true", help="Sample T_max frames across clip (use if model was trained with --spread_frames)")
     args = ap.parse_args()
 
     ckpt_dir = args.checkpoint_dir
@@ -75,7 +76,11 @@ def main():
                 pad = np.zeros((T_max - T, FEAT_PER_FRAME), dtype=np.float32)
                 arr = np.concatenate([arr, pad], axis=0)
             else:
-                arr = arr[:T_max]
+                if args.spread_frames:
+                    indices = np.linspace(0, T - 1, T_max).astype(np.int64)
+                    arr = arr[indices]
+                else:
+                    arr = arr[:T_max]
             x = arr.reshape(1, -1).astype(np.float32)
             x = (x - mean) / std
             z = encoder(torch.from_numpy(x)).numpy()[0]
