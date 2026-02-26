@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 Train an MLP auto-encoder on animation pose sequences.
-
-Key changes vs your original:
 - Train encoder on FRAME FEATURES ONLY (no energy concatenated into encoder input).
 - Use DERIVATIVE (velocity) input by default: Δpos + Δquatlog (same 90 dims per frame).
 - Contrastive loss uses SEMANTIC augmentations: time-shift and optional mirroring (no "noise on whole vector").
@@ -525,7 +523,7 @@ def main():
     ap.add_argument("--latent", type=int, default=LATENT_DIM)
 
     ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val_ratio", type=float, default=0.2)
     ap.add_argument("--spread_frames", action="store_true", default=True)
@@ -753,7 +751,6 @@ def main():
         energy_mean=e_mean,
         energy_std=e_std,
         T_max=args.T_max,
-        input_dim=frame_dim,
         frame_dim=frame_dim,
         feat_per_frame=FEAT_PER_FRAME,
         num_bones=NUM_BONES,
