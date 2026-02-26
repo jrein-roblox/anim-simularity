@@ -2,12 +2,12 @@
 """
 Unit tests for the animation encoder.
 
-Requires: trained checkpoint (norm.npz, encoder.pt) and clip CSVs in train_data.
+Requires: trained checkpoint (norm.npz, encoder.pt) and packed clips (.npz from pack_training_data.py).
 Run from repo root:
   pytest ml_training/test_encoder.py -v
   python ml_training/test_encoder.py   # run as script for quick check
 
-Uses up to 100 clip CSVs from ML_TRAIN_DATA (default ml_training/train_data).
+Uses up to 100 clips from packed file ML_PACKED_DATA (default ml_training/train_data.npz).
 Checkpoint from ML_CHECKPOINT_DIR (default ml_training/checkpoints).
 
 Tests:
@@ -35,13 +35,26 @@ ML_TRAINING = Path(__file__).resolve().parent
 
 from train_autoencoder import (
     Encoder,
-    load_clip_csv,
-    compute_bone_energy,
     FEAT_PER_FRAME,
     NUM_BONES,
     FEAT_PER_BONE,
     ENERGY_DIM,
 )
+
+
+def compute_bone_energy(arr: np.ndarray) -> np.ndarray:
+    """Per-bone energy: sum of frame-to-frame L2 delta (pos) + L2 delta (quatlog). arr (T, 90) -> (15,)."""
+    T = arr.shape[0]
+    out = np.zeros(ENERGY_DIM, dtype=np.float32)
+    if T < 2:
+        return out
+    for b in range(NUM_BONES):
+        pos = arr[:, b * 6 : b * 6 + 3]
+        quat = arr[:, b * 6 + 3 : b * 6 + 6]
+        dpos = np.diff(pos, axis=0)
+        dquat = np.diff(quat, axis=0)
+        out[b] = np.sqrt((dpos ** 2).sum(axis=1)).sum() + np.sqrt((dquat ** 2).sum(axis=1)).sum()
+    return out
 
 # Mirror/pad helpers (may not exist in rolled-back trainer; define here for tests)
 R15_MIRROR_AXIS = "x"
@@ -132,7 +145,7 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
-def _load_encoder_and_norm(data_dir: Path, checkpoint_dir: Path):
+def _load_encoder_and_norm(checkpoint_dir: Path):
     """Load norm.npz and encoder; support old (frames+energy) and new (frame-only) norm formats."""
     norm_path = checkpoint_dir / "norm.npz"
     enc_path = checkpoint_dir / "encoder.pt"
@@ -226,19 +239,15 @@ def embed_clip(ctx: dict, arr: np.ndarray) -> np.ndarray:
     return z
 
 
-def collect_clip_paths(data_dir: Path, max_clips: int = 100) -> list[Path]:
-    """Return up to max_clips paths to clip CSVs (animId-clipId.csv)."""
-    if not data_dir.is_dir():
+def load_clips_from_packed(packed_path: Path, max_clips: int = 100) -> list[np.ndarray]:
+    """Load up to max_clips clip arrays (T_max, 90) from packed .npz. Returns list of (T_max, 90) arrays."""
+    if not packed_path.is_file():
         return []
-    paths = []
-    for f in sorted(data_dir.iterdir()):
-        if f.suffix.lower() == ".csv" and f.name != "manifest.csv":
-            parts = f.stem.split("-")
-            if len(parts) == 2:
-                paths.append(f)
-                if len(paths) >= max_clips:
-                    break
-    return paths
+    data = np.load(packed_path, allow_pickle=True)
+    frames = data["frames"]  # (N, T_max, 90)
+    N = frames.shape[0]
+    n = min(N, max_clips)
+    return [np.asarray(frames[i], dtype=np.float32) for i in range(n)]
 
 
 # -----------------------------------------------------------------------------
@@ -246,12 +255,12 @@ def collect_clip_paths(data_dir: Path, max_clips: int = 100) -> list[Path]:
 # -----------------------------------------------------------------------------
 
 def _get_ctx_and_clips():
-    data_dir = Path(os.environ.get("ML_TRAIN_DATA", str(ML_TRAINING / "train_data")))
+    packed_path = Path(os.environ.get("ML_PACKED_DATA", str(ML_TRAINING / "train_data.npz")))
     checkpoint_dir = Path(os.environ.get("ML_CHECKPOINT_DIR", str(ML_TRAINING / "checkpoints")))
-    ctx = _load_encoder_and_norm(data_dir, checkpoint_dir)
+    ctx = _load_encoder_and_norm(checkpoint_dir)
     if ctx is None:
         return None, []
-    clips = collect_clip_paths(data_dir, max_clips=100)
+    clips = load_clips_from_packed(packed_path, max_clips=100)
     return ctx, clips
 
 
@@ -265,11 +274,9 @@ def test_encoder_determinism():
     ctx, clips = _get_ctx_and_clips()
     if ctx is None or len(clips) < 1:
         import pytest
-        pytest.skip("Need checkpoint and at least one clip CSV")
+        pytest.skip("Need checkpoint and at least one clip in packed file")
     np.random.seed(42)
-    path = clips[0]
-    arr = load_clip_csv(str(path))
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+    arr = np.nan_to_num(clips[0], nan=0.0, posinf=0.0, neginf=0.0, copy=False)
     z1 = embed_clip(ctx, arr)
     z2 = embed_clip(ctx, arr)
     assert z1.shape == z2.shape
@@ -282,13 +289,12 @@ def test_encoder_mirror_similar():
     ctx, clips = _get_ctx_and_clips()
     if ctx is None or len(clips) < 1:
         import pytest
-        pytest.skip("Need checkpoint and at least one clip CSV")
+        pytest.skip("Need checkpoint and at least one clip in packed file")
     if ctx.get("format") == "old":
         import pytest
         pytest.skip("Old checkpoint (frames+energy) was not trained with mirroring")
     similarity_threshold = 0.90
-    for path in clips[:20]:
-        arr = load_clip_csv(str(path))
+    for i, arr in enumerate(clips[:20]):
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
         if arr.shape[0] < 2:
             continue
@@ -297,7 +303,7 @@ def test_encoder_mirror_similar():
         z_mirror = embed_clip(ctx, arr_mirror)
         sim = cosine_similarity(z_orig, z_mirror)
         assert sim >= similarity_threshold, (
-            f"Mirrored clip {path.name} similarity {sim:.4f} < {similarity_threshold}"
+            f"Mirrored clip {i} similarity {sim:.4f} < {similarity_threshold}"
         )
     # If we had at least one multi-frame clip, we're good
     assert True
@@ -309,11 +315,10 @@ def test_encoder_time_offset_similar():
     ctx, clips = _get_ctx_and_clips()
     if ctx is None or len(clips) < 1:
         import pytest
-        pytest.skip("Need checkpoint and at least one clip CSV")
+        pytest.skip("Need checkpoint and at least one clip in packed file")
     similarity_threshold = 0.90
     np.random.seed(123)
-    for path in clips[:25]:
-        arr = load_clip_csv(str(path))
+    for i, arr in enumerate(clips[:25]):
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
         T = arr.shape[0]
         if T < 10:
@@ -326,7 +331,7 @@ def test_encoder_time_offset_similar():
         z_shifted = embed_clip(ctx, arr_shifted)
         sim = cosine_similarity(z_orig, z_shifted)
         assert sim >= similarity_threshold, (
-            f"Time-offset clip {path.name} similarity {sim:.4f} < {similarity_threshold}"
+            f"Time-offset clip {i} similarity {sim:.4f} < {similarity_threshold}"
         )
     assert True
 
@@ -336,15 +341,14 @@ def test_encoder_small_noise_similar():
     ctx, clips = _get_ctx_and_clips()
     if ctx is None or len(clips) < 1:
         import pytest
-        pytest.skip("Need checkpoint and at least one clip CSV")
+        pytest.skip("Need checkpoint and at least one clip in packed file")
     similarity_threshold = 0.90
     min_ratio_pass = 0.80  # at least 80% of clips must pass
     noise_scale = 0.02
     np.random.seed(456)
     passed = 0
     total = 0
-    for path in clips[:25]:
-        arr = load_clip_csv(str(path))
+    for arr in clips[:25]:
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
         if arr.shape[0] == 0:
             continue
@@ -368,11 +372,10 @@ def test_encoder_zeroed_frames_similar():
     ctx, clips = _get_ctx_and_clips()
     if ctx is None or len(clips) < 1:
         import pytest
-        pytest.skip("Need checkpoint and at least one clip CSV")
+        pytest.skip("Need checkpoint and at least one clip in packed file")
     similarity_threshold = 0.95
     np.random.seed(789)
-    for path in clips[:25]:
-        arr = load_clip_csv(str(path))
+    for i, arr in enumerate(clips[:25]):
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
         T = arr.shape[0]
         if T < 5:
@@ -380,14 +383,14 @@ def test_encoder_zeroed_frames_similar():
         arr_mod = arr.copy()
         n_rep = max(1, T // 15)
         indices = np.random.choice(T, size=min(n_rep, T), replace=False)
-        for i in indices:
-            if i > 0:
-                arr_mod[i] = arr_mod[i - 1]
+        for j in indices:
+            if j > 0:
+                arr_mod[j] = arr_mod[j - 1]
         z_orig = embed_clip(ctx, arr)
         z_mod = embed_clip(ctx, arr_mod)
         sim = cosine_similarity(z_orig, z_mod)
         assert sim >= similarity_threshold, (
-            f"Repeated-frames clip {path.name} similarity {sim:.4f} < {similarity_threshold}"
+            f"Repeated-frames clip {i} similarity {sim:.4f} < {similarity_threshold}"
         )
     assert True
 
@@ -397,15 +400,12 @@ def test_encoder_large_changes_dissimilar():
     ctx, clips = _get_ctx_and_clips()
     if ctx is None or len(clips) < 2:
         import pytest
-        pytest.skip("Need checkpoint and at least 2 clip CSVs")
+        pytest.skip("Need checkpoint and at least 2 clips in packed file")
     similarity_upper = 0.95
     np.random.seed(101)
-    for i, path_a in enumerate(clips[:15]):
-        path_b = clips[(i + 1) % len(clips)]
-        arr_a = load_clip_csv(str(path_a))
-        arr_b = load_clip_csv(str(path_b))
-        arr_a = np.nan_to_num(arr_a, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
-        arr_b = np.nan_to_num(arr_b, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+    for i in range(min(15, len(clips))):
+        arr_a = np.nan_to_num(clips[i], nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+        arr_b = np.nan_to_num(clips[(i + 1) % len(clips)], nan=0.0, posinf=0.0, neginf=0.0, copy=False)
         Ta, Tb = arr_a.shape[0], arr_b.shape[0]
         if Ta < 4 or Tb < 4:
             continue
@@ -418,7 +418,7 @@ def test_encoder_large_changes_dissimilar():
         z_mixed = embed_clip(ctx, arr_mixed)
         sim = cosine_similarity(z_orig, z_mixed)
         assert sim <= similarity_upper, (
-            f"Mixed clip {path_a.name}+{path_b.name} should be dissimilar: similarity {sim:.4f} > {similarity_upper}"
+            f"Mixed clip {i}+{(i+1)%len(clips)} should be dissimilar: similarity {sim:.4f} > {similarity_upper}"
         )
     assert True
 
@@ -428,11 +428,9 @@ def test_encoder_reversed_time_similar():
     ctx, clips = _get_ctx_and_clips()
     if ctx is None or len(clips) < 1:
         import pytest
-        pytest.skip("Need checkpoint and at least one clip CSV")
+        pytest.skip("Need checkpoint and at least one clip in packed file")
     # Reversed can be similar for symmetric motions; we only require it doesn't crash and sim is reasonable
-    similarity_lower = 0.50  # reversed might be somewhat similar
-    for path in clips[:15]:
-        arr = load_clip_csv(str(path))
+    for i, arr in enumerate(clips[:15]):
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
         if arr.shape[0] < 2:
             continue
@@ -441,7 +439,7 @@ def test_encoder_reversed_time_similar():
         z_rev = embed_clip(ctx, arr_rev)
         sim = cosine_similarity(z_orig, z_rev)
         # Reversed is not required to be very similar; we just check it's in a plausible range
-        assert -1.0 <= sim <= 1.0, f"Reversed clip {path.name} similarity out of range: {sim}"
+        assert -1.0 <= sim <= 1.0, f"Reversed clip {i} similarity out of range: {sim}"
 
 
 def test_encoder_same_content_padding_similar():
@@ -449,15 +447,9 @@ def test_encoder_same_content_padding_similar():
     ctx, clips = _get_ctx_and_clips()
     if ctx is None or len(clips) < 1:
         import pytest
-        pytest.skip("Need checkpoint and at least one clip CSV")
-    # We use the same clip; pad_or_sample is called inside embed_clip with fixed spread_frames.
-    # So we test: short clip padded to T_max vs same clip but we manually pad differently then pass in.
-    # Actually embed_clip always does pad_or_sample_to_tmax with ctx["spread_frames"]. So we can't easily
-    # test "different padding same content" without exposing a way to pass pre-padded arrays.
-    # Instead: two clips that are very similar (e.g. same file embedded twice) -> identical.
-    path = clips[0]
-    arr = load_clip_csv(str(path))
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+        pytest.skip("Need checkpoint and at least one clip in packed file")
+    # Same clip embedded twice -> identical.
+    arr = np.nan_to_num(clips[0], nan=0.0, posinf=0.0, neginf=0.0, copy=False)
     z1 = embed_clip(ctx, arr)
     z2 = embed_clip(ctx, arr)
     sim = cosine_similarity(z1, z2)
@@ -469,10 +461,9 @@ def test_encoder_different_clips_differ():
     ctx, clips = _get_ctx_and_clips()
     if ctx is None or len(clips) < 3:
         import pytest
-        pytest.skip("Need checkpoint and at least 3 clip CSVs")
+        pytest.skip("Need checkpoint and at least 3 clips in packed file")
     embs = []
-    for path in clips[:30]:
-        arr = load_clip_csv(str(path))
+    for arr in clips[:30]:
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
         if arr.shape[0] == 0:
             continue
@@ -506,9 +497,9 @@ if __name__ == "__main__":
             print("SKIP: No checkpoint (norm.npz, encoder.pt) found")
             sys.exit(0)
         if len(clips) < 1:
-            print("SKIP: No clip CSVs in data_dir")
+            print("SKIP: No clips in packed file (run pack_training_data.py first)")
             sys.exit(0)
-        print(f"Loaded encoder, T_max={ctx['T_max']}, {len(clips)} clips")
+        print(f"Loaded encoder, T_max={ctx['T_max']}, {len(clips)} clips from packed file")
         test_encoder_determinism()
         print("test_encoder_determinism OK")
         test_encoder_same_content_padding_similar()

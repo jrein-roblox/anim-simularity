@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Load trained encoder and clip CSVs; output embeddings CSV (animId, clipId, duration, emb1..embK).
+Load trained encoder and packed .npz; output embeddings CSV (animId, clipId, duration, emb1..embK).
 """
 import csv
 import os
@@ -11,23 +11,15 @@ import torch
 
 # Import same model as train_autoencoder
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from train_autoencoder import (
-    Encoder,
-    load_clip_csv,
-    load_manifest,
-    compute_bone_energy,
-    FEAT_PER_FRAME,
-    ENERGY_DIM,
-)
+from train_autoencoder import Encoder
 
 
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", default="ml_training/train_data")
+    ap.add_argument("--packed", default="ml_training/train_data.npz", help="Path to .npz from pack_training_data.py")
     ap.add_argument("--checkpoint_dir", default="ml_training/checkpoints")
     ap.add_argument("--output", default="ml_training/embeddings.csv")
-    ap.add_argument("--spread_frames", default=True, action="store_true", help="Sample T_max frames across clip (use if model was trained with --spread_frames)")
     args = ap.parse_args()
 
     ckpt_dir = args.checkpoint_dir
@@ -40,7 +32,6 @@ def main():
     T_max = int(norm["T_max"])
     input_dim = int(norm["input_dim"])
     frame_dim = int(norm.get("frame_dim", input_dim))
-    use_energy = frame_dim < input_dim
     latent_dim = int(norm["latent_dim"])
     h = norm.get("hidden_dims")
     if h is not None and getattr(h, "size", 0) > 0:
@@ -55,54 +46,25 @@ def main():
     encoder.load_state_dict(state)
     encoder.eval()
 
-    manifest = load_manifest(args.data_dir)
-    if not manifest:
-        manifest = []
-        for f in os.listdir(args.data_dir):
-            if f.endswith(".csv") and f != "manifest.csv":
-                parts = f[:-4].split("-")
-                if len(parts) == 2:
-                    path = os.path.join(args.data_dir, f)
-                    arr = load_clip_csv(path)
-                    manifest.append((parts[0], parts[1], 0.0, arr.shape[0]))
-
-    count = 0
+    if not os.path.isfile(args.packed):
+        raise SystemExit(f"Packed file not found: {args.packed}. Run pack_training_data.py first.")
+    data = np.load(args.packed, allow_pickle=True)
+    frames = data["frames"]
+    energy = data["energy"]
+    anim_ids = data["anim_id"]
+    clip_ids = data["clip_id"]
+    durations = data["duration"]
+    N = frames.shape[0]
     rows = []
     with torch.no_grad():
-        for item in manifest:
-            if len(item) == 4:
-                anim_id, clip_id, duration, num_frames = item
-            else:
-                anim_id, clip_id = item[0], item[1]
-                duration = 0.0
-            path = os.path.join(args.data_dir, f"{anim_id}-{clip_id}.csv")
-            if not os.path.isfile(path):
-                continue
-            arr = load_clip_csv(path)
-            if use_energy:
-                energy = compute_bone_energy(arr).reshape(1, -1)
-            T = arr.shape[0]
-            if T == 0:
-                arr = np.zeros((T_max, FEAT_PER_FRAME), dtype=np.float32)
-            elif T < T_max:
-                pad = np.repeat(arr[-1:], T_max - T, axis=0)
-                arr = np.concatenate([arr, pad], axis=0)
-            else:
-                if args.spread_frames:
-                    indices = np.linspace(0, T - 1, T_max).astype(np.int64)
-                    arr = arr[indices]
-                else:
-                    arr = arr[:T_max]
-            x = arr.reshape(1, -1).astype(np.float32)
-            if use_energy:
-                x = np.concatenate([x, energy], axis=1)
+        for i in range(N):
+            x = np.concatenate([frames[i].reshape(1, -1), energy[i].reshape(1, -1)], axis=1).astype(np.float32)
             x = (x - mean) / std
             z = encoder(torch.from_numpy(x)).numpy()[0]
-            row = [anim_id, clip_id, f"{duration:.6f}"] + [f"{z[i]:.8f}" for i in range(len(z))]
+            row = [str(anim_ids[i]), str(clip_ids[i]), f"{float(durations[i]):.6f}"] + [f"{z[j]:.8f}" for j in range(len(z))]
             rows.append(row)
-            count += 1
-            if count % 1000 == 0:
-                print(f"Processed {count} clips")
+            if (i + 1) % 1000 == 0:
+                print(f"Processed {i + 1} clips")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", newline="", encoding="utf-8") as f:
