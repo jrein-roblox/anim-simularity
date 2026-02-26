@@ -19,6 +19,50 @@ T_MAX = 90
 HIDDEN_DIMS = [512, 256]
 LATENT_DIM = 128
 
+# R15 L/R bone pairs for mirroring (mirror across x)
+R15_MIRROR_PAIRS = "3:6,4:7,5:8,9:12,10:13,11:14"
+
+
+def _parse_mirror_pairs(s: str) -> list:
+    pairs = []
+    for part in s.replace(" ", "").split(","):
+        if not part:
+            continue
+        a, b = part.split(":")
+        pairs.append((int(a), int(b)))
+    return pairs
+
+
+def _build_swap_index(num_bones: int, pairs: list) -> np.ndarray:
+    idx = np.arange(num_bones, dtype=np.int64)
+    for a, b in pairs:
+        if 0 <= a < num_bones and 0 <= b < num_bones:
+            idx[a], idx[b] = idx[b], idx[a]
+    return idx
+
+
+def _mirror_frames_batch(frames: np.ndarray, swap_idx: np.ndarray, axis: str = "x") -> np.ndarray:
+    """Mirror (N, T, 90) frames: swap L/R bones, negate position and quatlog on axis. Returns (N, T, 90)."""
+    N, T, _ = frames.shape
+    x4 = frames.reshape(N, T, NUM_BONES, FEAT_PER_BONE).copy()
+    x4 = x4[:, :, swap_idx, :]
+    pos = x4[:, :, :, 0:3]
+    rot = x4[:, :, :, 3:6]
+    if axis.lower() == "x":
+        pos[:, :, :, 0] = -pos[:, :, :, 0]
+        rot[:, :, :, 1] = -rot[:, :, :, 1]
+        rot[:, :, :, 2] = -rot[:, :, :, 2]
+    elif axis.lower() == "y":
+        pos[:, :, :, 1] = -pos[:, :, :, 1]
+        rot[:, :, :, 0] = -rot[:, :, :, 0]
+        rot[:, :, :, 2] = -rot[:, :, :, 2]
+    else:
+        pos[:, :, :, 2] = -pos[:, :, :, 2]
+        rot[:, :, :, 0] = -rot[:, :, :, 0]
+        rot[:, :, :, 1] = -rot[:, :, :, 1]
+    x4 = np.concatenate([pos, rot], axis=-1)
+    return x4.reshape(N, T, FEAT_PER_FRAME).astype(np.float32)
+
 
 def load_packed_data(packed_path: str):
     """Load from a .npz written by pack_training_data.py. Returns (X, frame_dim)."""
@@ -132,16 +176,17 @@ def main():
     ap.add_argument("--checkpoint_dir", default="ml_training/checkpoints", help="Where to save .pt and encoder_weights.lua")
     ap.add_argument("--hidden", type=int, nargs="+", default=HIDDEN_DIMS, help="Hidden layer sizes")
     ap.add_argument("--latent", type=int, default=LATENT_DIM, help="Latent dimension")
-    ap.add_argument("--epochs", type=int, default=80, help="Training epochs")
-    ap.add_argument("--batch_size", type=int, default=32)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--epochs", type=int, default=100, help="Training epochs")
+    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--val_ratio", type=float, default=0.2)
     ap.add_argument("--scheduler", choices=["none", "step", "multistep"], default="step", help="LR scheduler: step (every N epochs), multistep (at milestones), none")
-    ap.add_argument("--lr_step", type=int, default=25, help="For step scheduler: reduce LR every this many epochs")
+    ap.add_argument("--lr_step", type=int, default=20, help="For step scheduler: reduce LR every this many epochs")
     ap.add_argument("--lr_gamma", type=float, default=0.5, help="Multiply LR by this factor when scheduler steps")
-    ap.add_argument("--lr_milestones", type=int, nargs="+", default=[25, 50, 75], help="For multistep scheduler: epochs at which to reduce LR")
-    ap.add_argument("--infonce_weight", type=float, default=0.1, help="Weight for InfoNCE contrastive loss (0 to disable)")
-    ap.add_argument("--infonce_tau", type=float, default=0.07, help="Temperature for InfoNCE")
+    ap.add_argument("--lr_milestones", type=int, nargs="+", default=[15, 35, 55], help="For multistep scheduler: epochs at which to reduce LR")
+    ap.add_argument("--grad_clip", type=float, default=1.0, help="Max gradient norm for clipping (0 to disable)")
+    ap.add_argument("--infonce_weight", type=float, default=0.05, help="Weight for InfoNCE contrastive loss (0 to disable)")
+    ap.add_argument("--infonce_tau", type=float, default=0.1, help="Temperature for InfoNCE")
     ap.add_argument("--infonce_noise", type=float, default=0.02, help="Std of Gaussian noise for contrastive augmentation")
     args = ap.parse_args()
 
@@ -151,11 +196,23 @@ def main():
     if not os.path.isfile(args.packed):
         raise SystemExit(f"Packed file not found: {args.packed}. Run pack_training_data.py first.")
     print(f"Loading packed data from {args.packed}")
-    X, frame_dim = load_packed_data(args.packed)
     data = np.load(args.packed, allow_pickle=True)
+    frames = np.asarray(data["frames"], dtype=np.float32)  # (N, T_max, 90)
+    energy = np.asarray(data["energy"], dtype=np.float32)  # (N, 15)
     args.T_max = int(data["T_max"])
-    N, input_dim = X.shape
-    print(f"Loaded {N} clips, input_dim={input_dim} (frame_dim={frame_dim}, energy={ENERGY_DIM})")
+    N_orig = frames.shape[0]
+    frame_dim = args.T_max * FEAT_PER_FRAME
+
+    # Mirror all clips to double the training set (L/R invariance)
+    swap_idx = _build_swap_index(NUM_BONES, _parse_mirror_pairs(R15_MIRROR_PAIRS))
+    mirrored_frames = _mirror_frames_batch(frames, swap_idx, axis="x")
+    mirrored_energy = energy[:, swap_idx]  # reorder per-bone energy to match mirrored bones
+    frames = np.concatenate([frames, mirrored_frames], axis=0)  # (2*N_orig, T_max, 90)
+    energy = np.concatenate([energy, mirrored_energy], axis=0)   # (2*N_orig, 15)
+    N = frames.shape[0]
+    X = np.concatenate([frames.reshape(N, -1), energy], axis=1)
+    input_dim = X.shape[1]
+    print(f"Loaded {N_orig} clips + mirrored -> {N} total, input_dim={input_dim} (frame_dim={frame_dim}, energy={ENERGY_DIM})")
 
     # Normalize (optional): use mean/std of training set
     mean = X.mean(axis=0, keepdims=True)
@@ -182,6 +239,8 @@ def main():
     else:
         scheduler = None
     mse = nn.MSELoss()
+    if args.grad_clip > 0:
+        print(f"Gradient clipping: max_norm={args.grad_clip}")
     if args.infonce_weight > 0:
         print(f"InfoNCE: weight={args.infonce_weight}, tau={args.infonce_tau}, noise_std={args.infonce_noise}")
 
@@ -189,31 +248,37 @@ def main():
         model.train()
         perm_train = torch.randperm(X_train.size(0), device=device)
         total_loss = 0.0
+        total_mse = 0.0
         n_batches = 0
         for i in range(0, X_train.size(0), args.batch_size):
             idx = perm_train[i : i + args.batch_size]
             batch = X_train[idx]
             recon, z = model(batch)
-            loss = mse(recon, batch[:, :frame_dim])
+            mse_batch = mse(recon, batch[:, :frame_dim])
+            loss = mse_batch
             if args.infonce_weight > 0 and batch.size(0) > 1:
                 batch_aug = batch + args.infonce_noise * torch.randn_like(batch, device=batch.device)
                 z_aug = model.encoder(batch_aug)
                 loss = loss + args.infonce_weight * infonce_loss(z, z_aug, tau=args.infonce_tau)
             opt.zero_grad()
             loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             opt.step()
             total_loss += loss.item()
+            total_mse += mse_batch.item()
             n_batches += 1
         if scheduler is not None:
             scheduler.step()
         train_loss = total_loss / max(n_batches, 1)
+        train_mse = total_mse / max(n_batches, 1)
         model.eval()
         with torch.no_grad():
             recon_val, _ = model(X_val)
             val_loss = mse(recon_val, X_val[:, :frame_dim]).item()
         lr_str = f"  lr={opt.param_groups[0]['lr']:.2e}" if scheduler else ""
         if (ep + 1) % 1 == 0 or ep == 0:
-            print(f"Epoch {ep + 1}/{args.epochs}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}{lr_str}")
+            print(f"Epoch {ep + 1}/{args.epochs}  train_loss={train_loss:.6f}  train_mse={train_mse:.6f}  val_loss={val_loss:.6f}{lr_str}")
 
         if (ep + 1) % 10 == 0 or ep + 1 == args.epochs:
             with torch.no_grad():
