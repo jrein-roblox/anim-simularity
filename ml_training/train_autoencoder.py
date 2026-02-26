@@ -15,6 +15,7 @@ import torch.nn as nn
 
 # Defaults (must match Lua inference)
 FEAT_PER_FRAME = 90  # 15 bones × 6 (pos xyz + quatlog xyz)
+FEAT_PER_BONE = 6
 NUM_BONES = 15
 ENERGY_DIM = 15  # accumulated delta pos + quatlog per bone
 T_MAX = 90
@@ -369,23 +370,26 @@ def main():
         if (ep + 1) % 1 == 0 or ep == 0:
             print(f"Epoch {ep + 1}/{args.epochs}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}{lr_str}")
 
-    torch.save(model.state_dict(), os.path.join(checkpoint_dir, "autoencoder.pt"))
-    torch.save(model.encoder.state_dict(), os.path.join(checkpoint_dir, "encoder.pt"))
-    model = model.cpu()
-    # Export normalization for embed script
-    np.savez(
-        os.path.join(checkpoint_dir, "norm.npz"),
-        mean=mean.astype(np.float32),
-        std=std.astype(np.float32),
-        T_max=args.T_max,
-        input_dim=input_dim,
-        frame_dim=frame_dim,
-        energy_dim=ENERGY_DIM,
-        latent_dim=args.latent,
-        hidden_dims=np.array(args.hidden),
-    )
-    export_encoder_weights_lua(model.encoder, os.path.join(checkpoint_dir, "encoder_weights.lua"), args.T_max)
-    print(f"Saved checkpoints and encoder_weights.lua to {checkpoint_dir}")
+        if (ep + 1) % 10 == 0 or ep == 0:
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, "autoencoder.pt"))
+            torch.save(model.encoder.state_dict(), os.path.join(checkpoint_dir, "encoder.pt"))
+            model = model.cpu()
+            # Export normalization for embed script
+            np.savez(
+                os.path.join(checkpoint_dir, "norm.npz"),
+                mean=mean.astype(np.float32),
+                std=std.astype(np.float32),
+                T_max=args.T_max,
+                input_dim=input_dim,
+                frame_dim=frame_dim,
+                energy_dim=ENERGY_DIM,
+                latent_dim=args.latent,
+                hidden_dims=np.array(args.hidden),
+            )
+            export_encoder_weights_lua(model.encoder, os.path.join(checkpoint_dir, "encoder_weights.lua"), args.T_max)
+            print(f"Saved checkpoints and encoder_weights.lua to {checkpoint_dir}")
+
+            model = model.to(device)
 
 
 if __name__ == "__main__":

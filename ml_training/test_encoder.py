@@ -35,17 +35,60 @@ ML_TRAINING = Path(__file__).resolve().parent
 
 from train_autoencoder import (
     Encoder,
+    load_clip_csv,
+    compute_bone_energy,
     FEAT_PER_FRAME,
     NUM_BONES,
     FEAT_PER_BONE,
-    R15_MIRROR_AXIS,
-    R15_MIRROR_PAIRS,
-    build_swap_index,
-    load_clip_csv,
-    pad_or_sample_to_tmax,
-    to_derivative,
-    parse_mirror_pairs,
+    ENERGY_DIM,
 )
+
+# Mirror/pad helpers (may not exist in rolled-back trainer; define here for tests)
+R15_MIRROR_AXIS = "x"
+R15_MIRROR_PAIRS = "3:6,4:7,5:8,9:12,10:13,11:14"
+
+
+def _parse_mirror_pairs(s: str):
+    pairs = []
+    for part in s.replace(" ", "").split(","):
+        if not part:
+            continue
+        a, b = part.split(":")
+        pairs.append((int(a), int(b)))
+    return pairs
+
+
+def _build_swap_index(num_bones: int, pairs: list) -> np.ndarray:
+    idx = np.arange(num_bones, dtype=np.int64)
+    for a, b in pairs:
+        if 0 <= a < num_bones and 0 <= b < num_bones:
+            idx[a], idx[b] = idx[b], idx[a]
+    return idx
+
+
+def _pad_or_sample_to_tmax(arr: np.ndarray, t_max: int, spread_frames: bool) -> np.ndarray:
+    T = arr.shape[0]
+    if T == 0:
+        return np.zeros((t_max, FEAT_PER_FRAME), dtype=np.float32)
+    if T < t_max:
+        pad = np.repeat(arr[-1:], t_max - T, axis=0)
+        return np.concatenate([arr, pad], axis=0).astype(np.float32)
+    if T > t_max:
+        if spread_frames:
+            indices = np.linspace(0, T - 1, t_max, dtype=np.int64)
+            return arr[indices].astype(np.float32)
+        return arr[:t_max].astype(np.float32)
+    return arr.astype(np.float32)
+
+
+def _to_derivative(arr_abs: np.ndarray) -> np.ndarray:
+    T = arr_abs.shape[0]
+    if T <= 1:
+        return np.zeros_like(arr_abs)
+    out = np.zeros_like(arr_abs)
+    out[1:] = arr_abs[1:] - arr_abs[:-1]
+    out[0] = out[1]
+    return out
 
 
 def _mirror_frames_np(
@@ -90,32 +133,53 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _load_encoder_and_norm(data_dir: Path, checkpoint_dir: Path):
-    """Load norm.npz and encoder; return (encoder, norm_dict, swap_idx for mirror)."""
+    """Load norm.npz and encoder; support old (frames+energy) and new (frame-only) norm formats."""
     norm_path = checkpoint_dir / "norm.npz"
     enc_path = checkpoint_dir / "encoder.pt"
     if not norm_path.is_file() or not enc_path.is_file():
         return None
     norm = np.load(norm_path, allow_pickle=True)
     T_max = int(norm["T_max"])
-    frame_dim = int(norm["frame_dim"])
     latent_dim = int(norm["latent_dim"])
     h = norm.get("hidden_dims")
     if h is not None and getattr(h, "size", 0) > 0:
         hidden_dims = h.tolist() if hasattr(h, "tolist") else list(h)
     else:
         hidden_dims = [512, 256]
+    swap_idx = _build_swap_index(NUM_BONES, _parse_mirror_pairs(R15_MIRROR_PAIRS))
+
+    # Old format: mean, std, input_dim, frame_dim (encoder input = frames + energy)
+    if "mean" in norm and "input_dim" in norm:
+        mean = norm["mean"]
+        std = norm["std"]
+        input_dim = int(norm["input_dim"])
+        frame_dim = int(norm["frame_dim"])
+        encoder = Encoder(input_dim, hidden_dims, latent_dim)
+        state = torch.load(enc_path, map_location="cpu", weights_only=True)
+        encoder.load_state_dict(state)
+        encoder.eval()
+        return {
+            "encoder": encoder,
+            "T_max": T_max,
+            "frame_dim": frame_dim,
+            "input_dim": input_dim,
+            "mean": mean,
+            "std": std,
+            "use_energy": True,
+            "swap_idx": swap_idx,
+            "spread_frames": True,
+            "format": "old",
+        }
+
+    # New format: frame_mean, frame_std, frame_dim, use_derivative (frame-only input)
+    frame_dim = int(norm["frame_dim"])
     frame_mean = norm["frame_mean"]
     frame_std = norm["frame_std"]
     use_derivative = bool(norm.get("use_derivative", np.array(1))[0])
-
     encoder = Encoder(frame_dim, hidden_dims, latent_dim)
     state = torch.load(enc_path, map_location="cpu", weights_only=True)
     encoder.load_state_dict(state)
     encoder.eval()
-
-    mirror_pairs = parse_mirror_pairs(R15_MIRROR_PAIRS)
-    swap_idx = build_swap_index(NUM_BONES, mirror_pairs)
-
     return {
         "encoder": encoder,
         "T_max": T_max,
@@ -125,29 +189,38 @@ def _load_encoder_and_norm(data_dir: Path, checkpoint_dir: Path):
         "use_derivative": use_derivative,
         "swap_idx": swap_idx,
         "spread_frames": True,
+        "format": "new",
     }
 
 
 def embed_clip(ctx: dict, arr: np.ndarray) -> np.ndarray:
     """
     Embed a single clip. arr: (T, 90) in absolute frame form.
-    Will be padded/sampled to T_max, optionally converted to derivative, normalized, encoded.
+    Supports old format (frames + energy) and new format (frame-only, optional derivative).
     """
     T_max = ctx["T_max"]
-    spread_frames = ctx["spread_frames"]
-    use_derivative = ctx["use_derivative"]
-    frame_mean = ctx["frame_mean"]
-    frame_std = ctx["frame_std"]
     encoder = ctx["encoder"]
 
-    if arr.shape[0] == 0:
-        arr = np.zeros((T_max, FEAT_PER_FRAME), dtype=np.float32)
+    if ctx["format"] == "old":
+        # Old trainer: pad/sample to T_max, concat per-bone energy, normalize with mean/std
+        energy = compute_bone_energy(arr).reshape(1, -1)
+        if arr.shape[0] == 0:
+            arr = np.zeros((T_max, FEAT_PER_FRAME), dtype=np.float32)
+        else:
+            arr = _pad_or_sample_to_tmax(arr, T_max, ctx["spread_frames"])
+        x = np.concatenate([arr.reshape(1, -1).astype(np.float32), energy], axis=1)
+        x = (x - ctx["mean"]) / ctx["std"]
     else:
-        arr = pad_or_sample_to_tmax(arr, T_max, spread_frames)
-    if use_derivative:
-        arr = to_derivative(arr)
-    x = arr.reshape(1, -1).astype(np.float32)
-    x = (x - frame_mean) / frame_std
+        # New format: pad/sample, optional derivative, normalize with frame_mean/frame_std
+        if arr.shape[0] == 0:
+            arr = np.zeros((T_max, FEAT_PER_FRAME), dtype=np.float32)
+        else:
+            arr = _pad_or_sample_to_tmax(arr, T_max, ctx["spread_frames"])
+        if ctx["use_derivative"]:
+            arr = _to_derivative(arr)
+        x = arr.reshape(1, -1).astype(np.float32)
+        x = (x - ctx["frame_mean"]) / ctx["frame_std"]
+
     with torch.no_grad():
         z = encoder(torch.from_numpy(x)).numpy()[0]
     return z
@@ -204,11 +277,15 @@ def test_encoder_determinism():
 
 
 def test_encoder_mirror_similar():
-    """Mirrored clip should have high cosine similarity to original (semantic invariance)."""
+    """Mirrored clip should have high cosine similarity to original (semantic invariance).
+    Skipped for old checkpoint (frames+energy) which was not trained with mirroring."""
     ctx, clips = _get_ctx_and_clips()
     if ctx is None or len(clips) < 1:
         import pytest
         pytest.skip("Need checkpoint and at least one clip CSV")
+    if ctx.get("format") == "old":
+        import pytest
+        pytest.skip("Old checkpoint (frames+energy) was not trained with mirroring")
     similarity_threshold = 0.90
     for path in clips[:20]:
         arr = load_clip_csv(str(path))
