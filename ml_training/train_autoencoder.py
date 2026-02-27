@@ -65,14 +65,13 @@ def _mirror_frames_batch(frames: np.ndarray, swap_idx: np.ndarray, axis: str = "
 
 
 def load_packed_data(packed_path: str):
-    """Load from a .npz written by pack_training_data.py. Returns (X, frame_dim)."""
+    """Load from a .npz written by pack_training_data.py. Returns (X_frames, frame_dim). X_frames is (N, T_max*90) only."""
     data = np.load(packed_path, allow_pickle=True)
     frames = data["frames"]
-    energy = data["energy"]
     N = frames.shape[0]
     t_max = int(data["T_max"])
     frame_dim = t_max * FEAT_PER_FRAME
-    X = np.concatenate([frames.reshape(N, -1), energy], axis=1)
+    X = frames.reshape(N, -1)
     return X, frame_dim
 
 
@@ -96,10 +95,12 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim: int, hidden_dims: list, output_dim: int):
+    """Decoder takes (z, energy) and outputs frames. input_dim = latent_dim + ENERGY_DIM."""
+    def __init__(self, latent_dim: int, energy_dim: int, hidden_dims: list, output_dim: int):
         super().__init__()
+        decoder_input_dim = latent_dim + energy_dim
         layers = []
-        prev = latent_dim
+        prev = decoder_input_dim
         for h in reversed(hidden_dims):
             layers.append(nn.Linear(prev, h))
             layers.append(nn.ReLU())
@@ -107,7 +108,8 @@ class Decoder(nn.Module):
         layers.append(nn.Linear(prev, output_dim))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, z: torch.Tensor, energy: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([z, energy], dim=1)
         return self.net(x)
 
 
@@ -115,11 +117,12 @@ class AutoEncoder(nn.Module):
     def __init__(self, input_dim: int, frame_dim: int, hidden_dims: list, latent_dim: int):
         super().__init__()
         self.encoder = Encoder(input_dim, hidden_dims, latent_dim)
-        self.decoder = Decoder(latent_dim, hidden_dims, frame_dim)
+        self.decoder = Decoder(latent_dim, ENERGY_DIM, hidden_dims, frame_dim)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, energy: torch.Tensor):
         z = self.encoder(x)
-        return self.decoder(z), z
+        recon = self.decoder(z, energy)
+        return recon, z
 
 
 def infonce_loss(z: torch.Tensor, z_aug: torch.Tensor, tau: float = 0.07) -> torch.Tensor:
@@ -146,7 +149,7 @@ def export_encoder_weights_lua(encoder: Encoder, out_path: str, t_max: int):
     """Write encoder weights to a Lua file that returns a table. Each layer: weight[out][in], bias[out]."""
     linear_layers = [m for m in encoder.net if isinstance(m, nn.Linear)]
     lines = [
-        "-- Encoder weights (auto-generated); input = T_max*90 frame features + 15 per-bone energy (if used).",
+        "-- Encoder weights (auto-generated); input = T_max*90 frame features only.",
         "return {",
         f"  T_max = {t_max},",
         f"  inputDim = {encoder.input_dim},",
@@ -208,13 +211,13 @@ def main():
     mirrored_frames = _mirror_frames_batch(frames, swap_idx, axis="x")
     mirrored_energy = energy[:, swap_idx]  # reorder per-bone energy to match mirrored bones
     frames = np.concatenate([frames, mirrored_frames], axis=0)  # (2*N_orig, T_max, 90)
-    energy = np.concatenate([energy, mirrored_energy], axis=0)   # (2*N_orig, 15)
+    energy = np.concatenate([energy, mirrored_energy], axis=0)   # (2*N_orig, 15) for auxiliary loss only
     N = frames.shape[0]
-    X = np.concatenate([frames.reshape(N, -1), energy], axis=1)
-    input_dim = X.shape[1]
-    print(f"Loaded {N_orig} clips + mirrored -> {N} total, input_dim={input_dim} (frame_dim={frame_dim}, energy={ENERGY_DIM})")
+    X = frames.reshape(N, -1).astype(np.float32)  # frames only (no energy as input)
+    input_dim = frame_dim  # encoder input = T_max*90 only
+    print(f"Loaded {N_orig} clips + mirrored -> {N} total, input_dim={input_dim} (frames only; energy as aux target)")
 
-    # Normalize (optional): use mean/std of training set
+    # Normalize frames only
     mean = X.mean(axis=0, keepdims=True)
     std = X.std(axis=0, keepdims=True) + 1e-6
     X = (X - mean) / std
@@ -229,6 +232,8 @@ def main():
 
     X_train = torch.from_numpy(X[train_idx]).float().to(device)
     X_val = torch.from_numpy(X[val_idx]).float().to(device)
+    Energy_train = torch.from_numpy(energy[train_idx]).float().to(device)
+    Energy_val = torch.from_numpy(energy[val_idx]).float().to(device)
 
     model = AutoEncoder(input_dim, frame_dim, args.hidden, args.latent).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -243,6 +248,7 @@ def main():
         print(f"Gradient clipping: max_norm={args.grad_clip}")
     if args.infonce_weight > 0:
         print(f"InfoNCE: weight={args.infonce_weight}, tau={args.infonce_tau}, noise_std={args.infonce_noise}")
+    print("Decoder conditioned on energy (z, energy) -> frames")
 
     for ep in range(args.epochs):
         model.train()
@@ -253,8 +259,9 @@ def main():
         for i in range(0, X_train.size(0), args.batch_size):
             idx = perm_train[i : i + args.batch_size]
             batch = X_train[idx]
-            recon, z = model(batch)
-            mse_batch = mse(recon, batch[:, :frame_dim])
+            batch_energy = Energy_train[idx]
+            recon, z = model(batch, batch_energy)
+            mse_batch = mse(recon, batch)
             loss = mse_batch
             if args.infonce_weight > 0 and batch.size(0) > 1:
                 batch_aug = batch + args.infonce_noise * torch.randn_like(batch, device=batch.device)
@@ -274,8 +281,8 @@ def main():
         train_mse = total_mse / max(n_batches, 1)
         model.eval()
         with torch.no_grad():
-            recon_val, _ = model(X_val)
-            val_loss = mse(recon_val, X_val[:, :frame_dim]).item()
+            recon_val, _ = model(X_val, Energy_val)
+            val_loss = mse(recon_val, X_val).item()
         lr_str = f"  lr={opt.param_groups[0]['lr']:.2e}" if scheduler else ""
         if (ep + 1) % 1 == 0 or ep == 0:
             print(f"Epoch {ep + 1}/{args.epochs}  train_loss={train_loss:.6f}  train_mse={train_mse:.6f}  val_loss={val_loss:.6f}{lr_str}")
@@ -293,7 +300,6 @@ def main():
                     T_max=args.T_max,
                     input_dim=input_dim,
                     frame_dim=frame_dim,
-                    energy_dim=ENERGY_DIM,
                     latent_dim=args.latent,
                     hidden_dims=np.array(args.hidden),
                 )

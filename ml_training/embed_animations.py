@@ -30,8 +30,7 @@ def main():
 
     norm = np.load(norm_path, allow_pickle=True)
     T_max = int(norm["T_max"])
-    input_dim = int(norm["input_dim"])
-    frame_dim = int(norm.get("frame_dim", input_dim))
+    input_dim = int(norm["input_dim"])  # frames only (T_max*90)
     latent_dim = int(norm["latent_dim"])
     h = norm.get("hidden_dims")
     if h is not None and getattr(h, "size", 0) > 0:
@@ -50,7 +49,6 @@ def main():
         raise SystemExit(f"Packed file not found: {args.packed}. Run pack_training_data.py first.")
     data = np.load(args.packed, allow_pickle=True)
     frames = data["frames"]
-    energy = data["energy"]
     anim_ids = data["anim_id"]
     clip_ids = data["clip_id"]
     durations = data["duration"]
@@ -58,7 +56,7 @@ def main():
     rows = []
     with torch.no_grad():
         for i in range(N):
-            x = np.concatenate([frames[i].reshape(1, -1), energy[i].reshape(1, -1)], axis=1).astype(np.float32)
+            x = np.asarray(frames[i], dtype=np.float32).reshape(1, -1)
             x = (x - mean) / std
             z = encoder(torch.from_numpy(x)).numpy()[0]
             row = [str(anim_ids[i]), str(clip_ids[i]), f"{float(durations[i]):.6f}"] + [f"{z[j]:.8f}" for j in range(len(z))]

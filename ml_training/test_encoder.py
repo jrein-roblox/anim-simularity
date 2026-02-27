@@ -38,23 +38,7 @@ from train_autoencoder import (
     FEAT_PER_FRAME,
     NUM_BONES,
     FEAT_PER_BONE,
-    ENERGY_DIM,
 )
-
-
-def compute_bone_energy(arr: np.ndarray) -> np.ndarray:
-    """Per-bone energy: sum of frame-to-frame L2 delta (pos) + L2 delta (quatlog). arr (T, 90) -> (15,)."""
-    T = arr.shape[0]
-    out = np.zeros(ENERGY_DIM, dtype=np.float32)
-    if T < 2:
-        return out
-    for b in range(NUM_BONES):
-        pos = arr[:, b * 6 : b * 6 + 3]
-        quat = arr[:, b * 6 + 3 : b * 6 + 6]
-        dpos = np.diff(pos, axis=0)
-        dquat = np.diff(quat, axis=0)
-        out[b] = np.sqrt((dpos ** 2).sum(axis=1)).sum() + np.sqrt((dquat ** 2).sum(axis=1)).sum()
-    return out
 
 # Mirror/pad helpers (may not exist in rolled-back trainer; define here for tests)
 R15_MIRROR_AXIS = "x"
@@ -161,12 +145,12 @@ def _load_encoder_and_norm(checkpoint_dir: Path):
         hidden_dims = [512, 256]
     swap_idx = _build_swap_index(NUM_BONES, _parse_mirror_pairs(R15_MIRROR_PAIRS))
 
-    # Old format: mean, std, input_dim, frame_dim (encoder input = frames + energy)
+    # Old format: mean, std, input_dim (encoder input = frames only, no energy)
     if "mean" in norm and "input_dim" in norm:
         mean = norm["mean"]
         std = norm["std"]
         input_dim = int(norm["input_dim"])
-        frame_dim = int(norm["frame_dim"])
+        frame_dim = int(norm.get("frame_dim", input_dim))
         encoder = Encoder(input_dim, hidden_dims, latent_dim)
         state = torch.load(enc_path, map_location="cpu", weights_only=True)
         encoder.load_state_dict(state)
@@ -178,7 +162,6 @@ def _load_encoder_and_norm(checkpoint_dir: Path):
             "input_dim": input_dim,
             "mean": mean,
             "std": std,
-            "use_energy": True,
             "swap_idx": swap_idx,
             "spread_frames": True,
             "format": "old",
@@ -209,19 +192,18 @@ def _load_encoder_and_norm(checkpoint_dir: Path):
 def embed_clip(ctx: dict, arr: np.ndarray) -> np.ndarray:
     """
     Embed a single clip. arr: (T, 90) in absolute frame form.
-    Supports old format (frames + energy) and new format (frame-only, optional derivative).
+    Supports old format (frames only, mean/std) and new format (frame-only, optional derivative).
     """
     T_max = ctx["T_max"]
     encoder = ctx["encoder"]
 
     if ctx["format"] == "old":
-        # Old trainer: pad/sample to T_max, concat per-bone energy, normalize with mean/std
-        energy = compute_bone_energy(arr).reshape(1, -1)
+        # Frames only: pad/sample to T_max, normalize with mean/std (no energy as input)
         if arr.shape[0] == 0:
             arr = np.zeros((T_max, FEAT_PER_FRAME), dtype=np.float32)
         else:
             arr = _pad_or_sample_to_tmax(arr, T_max, ctx["spread_frames"])
-        x = np.concatenate([arr.reshape(1, -1).astype(np.float32), energy], axis=1)
+        x = arr.reshape(1, -1).astype(np.float32)
         x = (x - ctx["mean"]) / ctx["std"]
     else:
         # New format: pad/sample, optional derivative, normalize with frame_mean/frame_std
