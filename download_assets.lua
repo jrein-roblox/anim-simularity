@@ -5,6 +5,10 @@
 --
 -- Requires: roblox_cli with FStringAuthCookie for InsertService:LoadAsset.
 -- Run: roblox-cli run --run <path>/download_assets.lua --fs.readwrite <path> --load.asRobloxScript
+
+-- C:\git\roblox\game-engine2\build\ninja\studio\vs2019\x64\optimized\Client\CLI\app\roblox-cli.exe run --run C:\git\roblox\jrein\anim-simularity\download_assets.lua --fs.readwrite C:\git\roblox\jrein\anim-simularity\ --load.asRobloxScript
+
+
 --
 -- Config: set BASE_PATH and INPUT_CSV below. Ensure out/ and out/clips/ exist.
 
