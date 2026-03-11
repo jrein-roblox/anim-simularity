@@ -14,6 +14,7 @@ Output npz contains:
 Run after extraction; then use --packed <path> with train_autoencoder.py and embed_animations.py.
 """
 import argparse
+import csv
 import os
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,13 +22,89 @@ import numpy as np
 
 from train_autoencoder import (
     FEAT_PER_FRAME,
-    load_clip_csv,
-    load_manifest,
-    compute_bone_energy,
+    ENERGY_DIM,
+    NUM_BONES
 )
 
 # Match trainer default
 T_MAX = 90
+
+
+def _safe_float(s: str) -> float:
+    if not isinstance(s, str):
+        s = str(s)
+    s_lower = s.strip().lower()
+    if s_lower in ("nan", "-nan", "nan(ind)", "-nan(ind)", "inf", "-inf", "+inf", ""):
+        return 0.0
+    try:
+        x = float(s)
+        return 0.0 if not np.isfinite(x) else x
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def load_manifest(data_dir: str):
+    manifest_path = os.path.join(data_dir, "manifest.csv")
+    if not os.path.isfile(manifest_path):
+        return None
+    rows = []
+    with open(manifest_path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader, None)
+        for row in reader:
+            if len(row) >= 4:
+                nf = max(0, int(_safe_float(row[3])))
+                rows.append((row[0], row[1], _safe_float(row[2]), nf))
+    return rows
+
+def compute_bone_energy(arr_abs: np.ndarray) -> np.ndarray:
+    """
+    Per-bone energy from ABSOLUTE frames (pre-derivative):
+    sum_t ||Δpos|| + ||Δquatlog|| per bone.
+    arr_abs: (T, 90) -> (15,)
+    """
+    T = arr_abs.shape[0]
+    out = np.zeros(ENERGY_DIM, dtype=np.float32)
+    if T < 2:
+        return out
+    for b in range(NUM_BONES):
+        pos = arr_abs[:, b * 6 : b * 6 + 3]
+        quatlog = arr_abs[:, b * 6 + 3 : b * 6 + 6]
+        dpos = np.diff(pos, axis=0)
+        dquat = np.diff(quatlog, axis=0)
+        out[b] = np.sqrt((dpos ** 2).sum(axis=1)).sum() + np.sqrt((dquat ** 2).sum(axis=1)).sum()
+    return out
+
+
+def load_clip_csv(path: str) -> np.ndarray:
+    """Load one clip CSV -> (T, 90). Replaces NaN/inf with 0. Uses numpy for fast parsing."""
+    try:
+        arr = np.genfromtxt(
+            path,
+            delimiter=",",
+            skip_header=1,
+            usecols=range(1, 1 + FEAT_PER_FRAME),
+            dtype=np.float32,
+            filling_values=0.0,
+            invalid_raise=False,
+            encoding="utf-8",
+        )
+    except Exception:
+        arr = np.zeros((0, FEAT_PER_FRAME), dtype=np.float32)
+
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    elif arr.size == 0:
+        arr = np.zeros((0, FEAT_PER_FRAME), dtype=np.float32)
+
+    # Ensure exactly FEAT_PER_FRAME columns
+    if arr.shape[1] < FEAT_PER_FRAME:
+        pad = np.zeros((arr.shape[0], FEAT_PER_FRAME - arr.shape[1]), dtype=np.float32)
+        arr = np.hstack([arr, pad])
+    elif arr.shape[1] > FEAT_PER_FRAME:
+        arr = arr[:, :FEAT_PER_FRAME]
+
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
 
 def _pad_or_sample(arr: np.ndarray, t_max: int, spread_frames: bool) -> np.ndarray:
