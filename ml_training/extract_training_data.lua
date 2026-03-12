@@ -14,6 +14,18 @@ local CLIPS_DIR = "out/clips"
 local TRAIN_DATA_DIR = "ml_training/train_data"
 local FPS = 30
 
+-- Create output directory and parents if missing.
+local function ensureDirectory(path: string)
+	local ok, err = pcall(function()
+		FileSystemService:CreateDirectories(path)
+	end)
+	if not ok then
+		warn("Failed to create directory:", path, err)
+	end
+end
+ensureDirectory("ml_training")
+ensureDirectory(TRAIN_DATA_DIR)
+
 local R15_BONES = {
 	"LowerTorso", "UpperTorso", "Head",
 	"LeftUpperArm", "LeftLowerArm", "LeftHand",

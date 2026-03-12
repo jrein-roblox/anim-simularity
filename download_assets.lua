@@ -10,12 +10,20 @@
 -- C:\git\roblox\game-engine2\build\ninja\studio\vs2019\x64\optimized\Client\CLI\app\roblox-cli.exe run --run C:\git\roblox\jrein\anim-simularity\download_assets.lua --fs.readwrite C:\git\roblox\jrein\anim-simularity\ --load.asRobloxScript
 
 
--- NOTE: create folders ./out/clips by hand until script is updated!
+local FileSystemService = game:GetService("FileSystemService")
+
+-- Create directory if missing (parents must exist or be created first).
+local function ensureDirectory(path: string)
+	local ok, err = pcall(function()
+		FileSystemService:CreateDirectories(path)
+	end)
+	if not ok then
+		warn("Failed to create directory:", path, err)
+	end
+end
 
 --
--- Config: set BASE_PATH and INPUT_CSV below. Ensure out/ and out/clips/ exist.
-
-local FileSystemService = game:GetService("FileSystemService")
+-- Config: set BASE_PATH and INPUT_CSV below.
 local InsertService = game:GetService("InsertService")
 
 -- create cvs from here https://superset.prod.dic.rbx.com/sqllab/
@@ -109,6 +117,8 @@ end
 -- ---------------------------------------------------------------------------
 local OUT_DIR = BASE_PATH .. "\\out"
 local CLIPS_DIR = OUT_DIR .. "\\clips"
+ensureDirectory(OUT_DIR)
+ensureDirectory(CLIPS_DIR)
 
 -- ---------------------------------------------------------------------------
 -- Main
