@@ -40,7 +40,7 @@ local DUPES_FNV = BASE_PATH .. "\\dupes_pose.csv"
 local DUPES_MURMUR = BASE_PATH .. "\\dupes_pose2.csv"
 local DUPES_COMBINED = BASE_PATH .. "\\dupes_pose3.csv"
 
-local FPS = 30
+local FPS = 120
 local NORMALIZE_DURATION = 1.0
 local LOG_EVERY = 100
 
@@ -61,10 +61,10 @@ local function spawnR15(cframe: CFrame): Model
 	return character
 end
 
-local character = spawnR15(CFrame.new(0, 0, 0))
-local humanoid = character.Humanoid
-local animator = humanoid.Animator
-local hrp = character:FindFirstChild("HumanoidRootPart") :: BasePart
+local character = nil
+local humanoid = nil
+local animator = nil
+local hrp = nil
 
 -- R15 bones (no HumanoidRootPart; root-space pose, no root motion)
 local R15_BONES = {
@@ -73,6 +73,25 @@ local R15_BONES = {
 	"RightUpperArm", "RightLowerArm", "RightHand",
 	"LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
 	"RightUpperLeg", "RightLowerLeg", "RightFoot",
+}
+
+-- Instance parent for each bone (standard R15 rig); used for local-space sampling
+local R15_BONE_PARENT: { [string]: string } = {
+	LowerTorso = "HumanoidRootPart",
+	UpperTorso = "LowerTorso",
+	Head = "UpperTorso",
+	LeftUpperArm = "UpperTorso",
+	LeftLowerArm = "LeftUpperArm",
+	LeftHand = "LeftLowerArm",
+	RightUpperArm = "UpperTorso",
+	RightLowerArm = "RightUpperArm",
+	RightHand = "RightLowerArm",
+	LeftUpperLeg = "LowerTorso",
+	LeftLowerLeg = "LeftUpperLeg",
+	LeftFoot = "LeftLowerLeg",
+	RightUpperLeg = "LowerTorso",
+	RightLowerLeg = "RightUpperLeg",
+	RightFoot = "RightLowerLeg",
 }
 
 -- =============================================================================
@@ -215,6 +234,24 @@ local function sampleRootSpacePose(): { [string]: AnimTransform }
 	return out
 end
 
+-- Same bone order as sampleRootSpacePose, but each transform is relative to the bone's
+-- parent BasePart (parent.CFrame:Inverse() * part.CFrame).
+local function sampleLocalPose(): { [string]: AnimTransform }
+	local out: { [string]: AnimTransform } = {}
+	for _, boneName in ipairs(R15_BONES) do
+		local parentName = R15_BONE_PARENT[boneName]
+		local part = character:FindFirstChild(boneName)
+		local parentPart = parentName and character:FindFirstChild(parentName)
+		if part and part:IsA("BasePart") and parentPart and parentPart:IsA("BasePart") then
+			local cf = parentPart.CFrame:Inverse() * part.CFrame
+			out[boneName] = { pos = cf.Position, rot = cf.Rotation }
+		else
+			out[boneName] = { pos = Vector3.zero, rot = CFrame.new() }
+		end
+	end
+	return out
+end
+
 -- =============================================================================
 -- Build ClipData by stepping the track (root-space, quantized)
 -- =============================================================================
@@ -234,7 +271,8 @@ local function buildClipData(track: AnimationTrack, duration: number): (ClipData
 		local srcT = t * duration
 		track.TimePosition = srcT
 		animator:StepAnimations(0)
-		local pose = sampleRootSpacePose()
+		--local pose = sampleRootSpacePose()
+		local pose = sampleLocalPose()
 		for _, bone in ipairs(R15_BONES) do
 			local fr = pose[bone]
 			local qx, qy, qz, qw = cframeToQuat(fr.rot)
@@ -246,8 +284,9 @@ local function buildClipData(track: AnimationTrack, duration: number): (ClipData
 			local py = quantizeFloat(fr.pos.Y, quantPos)
 			local pz = quantizeFloat(fr.pos.Z, quantPos)
 			out[bone][i + 1] = {
-				pos = Vector3.new(px, py, pz),
-				rot = quatToCFrame(qx, qy, qz, qw),
+				pos = {px, py, pz},
+				rot = {qx, qy, qz, qw},
+				time = srcT,
 			}
 		end
 	end
@@ -263,14 +302,13 @@ local function serializeClip(cs: ClipData, tracks: { string }): string
 		local series = cs[bone]
 		table.insert(chunks, writeUInt32LE(#series))
 		for _, fr in ipairs(series) do
-			table.insert(chunks, writeUInt32LE(fr.pos.X))
-			table.insert(chunks, writeUInt32LE(fr.pos.Y))
-			table.insert(chunks, writeUInt32LE(fr.pos.Z))
-			local qx, qy, qz, qw = cframeToQuat(fr.rot)
-			table.insert(chunks, writeUInt32LE(quantizeFloat(qx, 1e-4)))
-			table.insert(chunks, writeUInt32LE(quantizeFloat(qy, 1e-4)))
-			table.insert(chunks, writeUInt32LE(quantizeFloat(qz, 1e-4)))
-			table.insert(chunks, writeUInt32LE(quantizeFloat(qw, 1e-4)))
+			table.insert(chunks, writeUInt32LE(fr.pos[1]))
+			table.insert(chunks, writeUInt32LE(fr.pos[2]))
+			table.insert(chunks, writeUInt32LE(fr.pos[3]))
+			table.insert(chunks, writeUInt32LE(fr.rot[1]))
+			table.insert(chunks, writeUInt32LE(fr.rot[2]))
+			table.insert(chunks, writeUInt32LE(fr.rot[3]))
+			table.insert(chunks, writeUInt32LE(fr.rot[4]))
 		end
 	end
 	return table.concat(chunks)
@@ -320,12 +358,28 @@ local hashesCsvLines = {}
 local count = 0
 local skipped = 0
 
-local animation = Instance.new("Animation")
+-- disable retargeting for now, we don't want to accound for changes it makes yet
+game.Workspace.Retargeting = Enum.AnimatorRetargetingMode.Disabled
+print(game.Workspace.Retargeting)
 
+local animation = Instance.new("Animation")
+local testData = {
+		{Path = "C:/git/roblox/jrein/anim-simularity/out/clips/100457501997256-122514759454458.rbxm"},
+		{Path = "C:/git/roblox/jrein/anim-simularity/out/clips/100887243791240-137241572989040.rbxm"},
+}
+
+--for _, fileData in ipairs(testData) do
 for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRecursive) do
 	local path = fileData.Path
 	local instances = FileSystemService:LoadInstances(path)
 	local clip = instances and instances[1]
+
+	-- for testing only
+	if not clip or not clip:IsA("CurveAnimation") then
+		skipped += 1
+		if clip then clip:Destroy() end
+		continue
+	end
 
 	if not clip then
 		skipped += 1
@@ -336,10 +390,18 @@ for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRec
 		return KeyframeSequenceProvider:RegisterKeyframeSequence(clip)
 	end)
 	if not okRegister or not contentId then
+		print(contentId)
 		skipped += 1
 		clip:Destroy()
 		continue
 	end
+
+	-- TODO: we need to create a fresh character each clip cause there is
+	-- something that doesn't reset the pose each time.
+	character = spawnR15(CFrame.new(0, 0, 0))
+	humanoid = character.Humanoid
+	animator = humanoid.Animator
+	hrp = character:FindFirstChild("HumanoidRootPart") :: BasePart
 
 	animation.AnimationId = contentId
 	local track = animator:LoadAnimation(animation)
@@ -381,6 +443,24 @@ for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRec
 		else
 			table.insert(hashmapCombined[key], animId)
 		end
+
+		-- if animId == "100457501997256" or animId == "100887243791240" then
+		-- 	print(path)
+		-- 	local rig = clip:FindFirstChildOfClass("AnimationRigData")
+		-- 	print(rig)
+
+		-- 	print(clipHash, animId)
+		-- 	for _, bone in ipairs(tracks) do
+		-- 		local series = cs[bone]
+		-- 		if bone ~= "LeftHand" then
+		-- 			continue
+		-- 		end
+		-- 		for i, fr in ipairs(series) do
+		-- 			print(i, fr.time, fr.pos[1], fr.pos[2], fr.pos[3], fr.rot[1], fr.rot[2], fr.rot[3], fr.rot[4])		
+		-- 		end
+		-- 	end
+		-- end
+
 	end)
 
 	track:Stop(0)
@@ -402,6 +482,12 @@ for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRec
 	if count % LOG_EVERY == 0 then
 		print(count, "clips hashed")
 	end
+
+	-- nuke the character
+	character:Destroy()
+	humanoid = nil
+	animator = nil
+	hrp = nil
 
 	-- if count > 1000 then
 	-- 	break

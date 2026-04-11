@@ -289,8 +289,9 @@ local function canonicalize(curveAnim: Instance, duration: number, params: Finge
 			local py = quantizeFloat(fr.pos.Y, quantPos)
 			local pz = quantizeFloat(fr.pos.Z, quantPos)
 			frames[i + 1] = {
-				pos = Vector3.new(px, py, pz),
-				rot = quatToCFrame(qx, qy, qz, qw),
+				pos = {px, py, pz},
+				rot = {qx, qy, qz, qw},
+				time = srcT,
 			}
 		end
 		out[bone] = frames
@@ -304,14 +305,13 @@ local function serializeClip(cs: ClipData, tracks: { string }): string
 		local series = cs[bone]
 		table.insert(chunks, writeUInt32LE(#series))
 		for _, fr in ipairs(series) do
-			table.insert(chunks, writeUInt32LE(fr.pos.X))
-			table.insert(chunks, writeUInt32LE(fr.pos.Y))
-			table.insert(chunks, writeUInt32LE(fr.pos.Z))
-			local qx, qy, qz, qw = cframeToQuat(fr.rot)
-			table.insert(chunks, writeUInt32LE(quantizeFloat(qx, 1e-4)))
-			table.insert(chunks, writeUInt32LE(quantizeFloat(qy, 1e-4)))
-			table.insert(chunks, writeUInt32LE(quantizeFloat(qz, 1e-4)))
-			table.insert(chunks, writeUInt32LE(quantizeFloat(qw, 1e-4)))
+			table.insert(chunks, writeUInt32LE(fr.pos[1]))
+			table.insert(chunks, writeUInt32LE(fr.pos[2]))
+			table.insert(chunks, writeUInt32LE(fr.pos[3]))
+			table.insert(chunks, writeUInt32LE(fr.rot[1]))
+			table.insert(chunks, writeUInt32LE(fr.rot[2]))
+			table.insert(chunks, writeUInt32LE(fr.rot[3]))
+			table.insert(chunks, writeUInt32LE(fr.rot[4]))
 		end
 	end
 	return table.concat(chunks)
@@ -320,7 +320,7 @@ end
 local function hashAnimation(curveAnim: Instance, duration: number, params: FingerprintParams?): (number, number)
 	local cs, _, tracks = canonicalize(curveAnim, duration, params)
 	local bytes = serializeClip(cs, tracks)
-	return fnv1a32(bytes), murmur3_32(bytes)
+	return fnv1a32(bytes), murmur3_32(bytes), cs,tracks
 end
 
 -- =============================================================================
@@ -384,7 +384,7 @@ for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRec
 
 	local ok, err = pcall(function()
 		local duration = calculateCurveAnimLength(clip)
-		local clipHash, clipHash2 = hashAnimation(clip, duration, {
+		local clipHash, clipHash2, cs, tracks = hashAnimation(clip, duration, {
 			FPS = FPS,
 			DurationMode = DURATION_MODE,
 		})
@@ -413,6 +413,20 @@ for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRec
 		else
 			table.insert(hashmapCombined[key], animId)
 		end
+
+		-- if animId == "100457501997256" or animId == "100887243791240" then
+		-- 	print(clipHash, animId)
+		-- 	for _, bone in ipairs(tracks) do
+		-- 		local series = cs[bone]
+		-- 		if bone ~= "LeftHand" then
+		-- 			continue
+		-- 		end
+		-- 		print(bone)
+		-- 		for i, fr in ipairs(series) do
+		-- 			print(i, fr.time, fr.pos[1], fr.pos[2], fr.pos[3], fr.rot[1], fr.rot[2], fr.rot[3], fr.rot[4])		
+		-- 		end
+		-- 	end
+		-- end
 	end)
 
 	if not ok then
