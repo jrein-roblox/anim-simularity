@@ -375,11 +375,11 @@ for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRec
 	local clip = instances and instances[1]
 
 	-- for testing only
-	if not clip or not clip:IsA("CurveAnimation") then
-		skipped += 1
-		if clip then clip:Destroy() end
-		continue
-	end
+	-- if not clip or not clip:IsA("CurveAnimation") then
+	-- 	skipped += 1
+	-- 	if clip then clip:Destroy() end
+	-- 	continue
+	-- end
 
 	if not clip then
 		skipped += 1
