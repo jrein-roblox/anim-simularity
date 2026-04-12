@@ -209,7 +209,9 @@ for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRec
 	local track = animator:LoadAnimation(animation)
 	track:Play(0)
 	track.Looped = true
-	wait(0)
+	while track.Length == 0.0 do
+		wait(0)
+	end
 	local duration = track.Length
 	local animId, clipId = path:match("(%d+)%-(%d+)%.rbxm$")
 	if not animId or not clipId then

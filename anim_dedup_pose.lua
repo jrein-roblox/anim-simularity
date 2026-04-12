@@ -364,8 +364,8 @@ print(game.Workspace.Retargeting)
 
 local animation = Instance.new("Animation")
 local testData = {
-		{Path = "C:/git/roblox/jrein/anim-simularity/out/clips/100457501997256-122514759454458.rbxm"},
-		{Path = "C:/git/roblox/jrein/anim-simularity/out/clips/100887243791240-137241572989040.rbxm"},
+		{Path = "C:/git/roblox/jrein/anim-simularity/out/clips/70369896323248-97913495804086.rbxm"},
+		{Path = "C:/git/roblox/jrein/anim-simularity/out/clips/123790409181394-125606158001062.rbxm"},
 }
 
 --for _, fileData in ipairs(testData) do
@@ -407,7 +407,9 @@ for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRec
 	local track = animator:LoadAnimation(animation)
 	track:Play(0)
 	track.Looped = true
-	wait(0)
+	while track.Length == 0.0 do
+		wait(0)
+	end
 	local duration = track.Length
 	local animId, clipId = parseClipPath(path)
 	if not animId or not clipId then
@@ -420,6 +422,7 @@ for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRec
 		end
 		animator:StepAnimations(0)
 		skipped += 1
+		character:Destroy()
 		continue
 	end
 
@@ -444,22 +447,23 @@ for fileData in FileSystemService:Walk(CLIPS_DIR, Enum.FileSystemWalkMode.NonRec
 			table.insert(hashmapCombined[key], animId)
 		end
 
-		-- if animId == "100457501997256" or animId == "100887243791240" then
-		-- 	print(path)
-		-- 	local rig = clip:FindFirstChildOfClass("AnimationRigData")
-		-- 	print(rig)
+		--if animId == "100457501997256" or animId == "100887243791240" then
+			-- print(path)
+			-- local rig = clip:FindFirstChildOfClass("AnimationRigData")
+			-- print(rig)
 
-		-- 	print(clipHash, animId)
-		-- 	for _, bone in ipairs(tracks) do
-		-- 		local series = cs[bone]
-		-- 		if bone ~= "LeftHand" then
-		-- 			continue
-		-- 		end
-		-- 		for i, fr in ipairs(series) do
-		-- 			print(i, fr.time, fr.pos[1], fr.pos[2], fr.pos[3], fr.rot[1], fr.rot[2], fr.rot[3], fr.rot[4])		
-		-- 		end
-		-- 	end
-		-- end
+			-- print(clipHash, animId)
+			-- for _, bone in ipairs(tracks) do
+			-- 	local series = cs[bone]
+			-- 	print(bone)
+			-- 	if bone ~= "UpperTorso" then
+			-- 		continue
+			-- 	end
+			-- 	for i, fr in ipairs(series) do
+			-- 		print(i, fr.time, fr.pos[1], fr.pos[2], fr.pos[3], fr.rot[1], fr.rot[2], fr.rot[3], fr.rot[4])		
+			-- 	end
+			-- end
+		--end
 
 	end)
 
