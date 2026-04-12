@@ -40,7 +40,7 @@ local DUPES_FNV = BASE_PATH .. "\\dupes_pose.csv"
 local DUPES_MURMUR = BASE_PATH .. "\\dupes_pose2.csv"
 local DUPES_COMBINED = BASE_PATH .. "\\dupes_pose3.csv"
 
-local FPS = 120
+local FPS = 60
 local NORMALIZE_DURATION = 1.0
 local LOG_EVERY = 100
 
@@ -255,8 +255,8 @@ end
 -- =============================================================================
 -- Build ClipData by stepping the track (root-space, quantized)
 -- =============================================================================
-local quantPos = 1e-3
-local quantQuat = 1e-4
+local quantPos = 0.01
+local quantQuat = 0.01
 
 local function buildClipData(track: AnimationTrack, duration: number): (ClipData, number, { string })
 	local numFrames = math.max(1, math.floor(NORMALIZE_DURATION * FPS + 0.5))

@@ -37,7 +37,7 @@ local DUPES_FNV = BASE_PATH .. "\\dupes.csv"
 local DUPES_MURMUR = BASE_PATH .. "\\dupes2.csv"
 local DUPES_COMBINED = BASE_PATH .. "\\dupes3.csv"
 
-local FPS = 120
+local FPS = 60
 local DURATION_MODE = "NormalizeTo1"
 local LOG_EVERY = 100
 
@@ -261,8 +261,8 @@ end
 local function canonicalize(curveAnim: Instance, duration: number, params: FingerprintParams?): (ClipData, number, { string })
 	params = params or {}
 	local fps = params.FPS or 60
-	local quantPos = params.QuantPos or 1e-3
-	local quantQuat = params.QuantQuat or 1e-4
+	local quantPos = params.QuantPos or 0.01
+	local quantQuat = params.QuantQuat or 0.01
 	local durationMode = params.DurationMode or "NormalizeTo1"
 
 	local tracks = buildTrackList(params.TrackOrder)
